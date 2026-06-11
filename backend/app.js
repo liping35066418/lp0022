@@ -150,7 +150,7 @@ function startServer() {
       app.listen(PORT, () => {
         console.log(`酒店预订管理平台 API 服务已启动`);
         console.log(`服务地址: http://localhost:${PORT}`);
-        console.log(`默认管理员: admin / admin`);
+        console.log(`默认管理员: admin / 123456`);
       });
     }
   } catch (error) {

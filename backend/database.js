@@ -1,8 +1,14 @@
 const Database = require('better-sqlite3');
 const path = require('path');
+const fs = require('fs');
 const bcrypt = require('bcryptjs');
 
-const dbPath = path.join(__dirname, 'data', 'hotel.db');
+const dataDir = path.join(__dirname, 'data');
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
+
+const dbPath = path.join(dataDir, 'hotel.db');
 const db = new Database(dbPath);
 
 db.pragma('journal_mode = WAL');
@@ -238,11 +244,18 @@ function initDatabase() {
 
 function seedData() {
   const transaction = db.transaction(() => {
-    const userCount = db.prepare('SELECT COUNT(*) as count FROM users').get().count;
-    if (userCount === 0) {
-      const hashedPassword = bcrypt.hashSync('123456', 10);
+    const adminUser = db.prepare('SELECT * FROM users WHERE username = ?').get('admin');
+    const hashedPassword = bcrypt.hashSync('123456', 10);
+    
+    if (!adminUser) {
       db.prepare('INSERT INTO users (username, password, role) VALUES (?, ?, ?)').run('admin', hashedPassword, 'admin');
       console.log('种子数据: 管理员 admin/123456 创建完成');
+    } else {
+      const isValidPassword = bcrypt.compareSync('123456', adminUser.password);
+      if (!isValidPassword) {
+        db.prepare('UPDATE users SET password = ? WHERE username = ?').run(hashedPassword, 'admin');
+        console.log('种子数据: 管理员 admin 密码已重置为 123456');
+      }
     }
 
     const roomTypeCount = db.prepare('SELECT COUNT(*) as count FROM room_types').get().count;
