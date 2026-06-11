@@ -89,18 +89,10 @@ async function handleLogin() {
         password: loginForm.password
       })
       userStore.setToken(res.data.token)
-      userStore.setUserInfo(res.data.userInfo)
-      ElMessage.success('登录成功')
+      userStore.setUserInfo(res.data.user)
+      ElMessage.success(res.message || '登录成功')
       router.push('/dashboard')
     } catch (e) {
-      if (loginForm.username === 'admin' && loginForm.password === '123456') {
-        userStore.setToken('mock-token-' + Date.now())
-        userStore.setUserInfo({ username: 'admin', name: '系统管理员' })
-        ElMessage.success('登录成功（演示模式）')
-        router.push('/dashboard')
-      } else {
-        ElMessage.error('用户名或密码错误')
-      }
     }
   } catch (e) {
   } finally {

@@ -240,9 +240,9 @@ function seedData() {
   const transaction = db.transaction(() => {
     const userCount = db.prepare('SELECT COUNT(*) as count FROM users').get().count;
     if (userCount === 0) {
-      const hashedPassword = bcrypt.hashSync('admin', 10);
+      const hashedPassword = bcrypt.hashSync('123456', 10);
       db.prepare('INSERT INTO users (username, password, role) VALUES (?, ?, ?)').run('admin', hashedPassword, 'admin');
-      console.log('种子数据: 管理员 admin/admin 创建完成');
+      console.log('种子数据: 管理员 admin/123456 创建完成');
     }
 
     const roomTypeCount = db.prepare('SELECT COUNT(*) as count FROM room_types').get().count;
