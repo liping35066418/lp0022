@@ -1,0 +1,719 @@
+const { db } = require('../database');
+const { success, error } = require('../utils/response');
+const moment = require('moment');
+
+const now = () => new Date().toISOString();
+const WEEKEND_RATE_DEFAULT = 120;
+
+function parseJSON(val) {
+  if (!val) return [];
+  try { return JSON.parse(val); } catch (e) { return []; }
+}
+
+function isWeekend(dateStr) {
+  const day = moment(dateStr).day();
+  return day === 0 || day === 6;
+}
+
+function getDateRange(startDate, endDate) {
+  const start = moment(startDate);
+  const end = moment(endDate);
+  const nights = end.diff(start, 'days');
+  if (nights <= 0) return [];
+  const dates = [];
+  for (let i = 0; i < nights; i++) {
+    dates.push(moment(start).add(i, 'days').format('YYYY-MM-DD'));
+  }
+  return dates;
+}
+
+function calculateDailyRate(roomTypeId, dateStr, memberDiscount = 100) {
+  const roomType = db.prepare('SELECT * FROM room_types WHERE id = ?').get(roomTypeId);
+  if (!roomType) return { original_price: 0, discounted_price: 0, price_type: 'base', is_holiday: false, holiday_name: null, base_price: 0 };
+
+  const dow = moment(dateStr).day();
+  const basePrice = parseFloat(roomType.base_price);
+  let dayPrice = basePrice;
+  let priceType = 'base';
+  let matchedHoliday = null;
+  let multiplier = 1;
+
+  const holiday = db.prepare(`
+    SELECT * FROM holidays
+    WHERE is_active = 1
+      AND (room_type_id IS NULL OR room_type_id = ?)
+      AND start_date <= ? AND end_date >= ?
+    ORDER BY price_multiplier DESC LIMIT 1
+  `).get(roomTypeId, dateStr, dateStr);
+
+  if (holiday) {
+    matchedHoliday = holiday;
+    priceType = 'holiday';
+    multiplier = parseFloat(holiday.price_multiplier) || 1;
+    dayPrice = basePrice * multiplier;
+  } else if (isWeekend(dateStr)) {
+    const weekendStrategy = db.prepare(`
+      SELECT * FROM price_strategies
+      WHERE room_type_id = ? AND is_active = 1 AND price_type = 'weekend'
+        AND (start_date IS NULL OR start_date <= ?)
+        AND (end_date IS NULL OR end_date >= ?)
+    `).get(roomTypeId, dateStr, dateStr);
+
+    if (weekendStrategy) {
+      dayPrice = parseFloat(weekendStrategy.price);
+    } else {
+      multiplier = WEEKEND_RATE_DEFAULT / 100;
+      dayPrice = basePrice * multiplier;
+    }
+    priceType = 'weekend';
+  } else {
+    const weekdayStrategy = db.prepare(`
+      SELECT * FROM price_strategies
+      WHERE room_type_id = ? AND is_active = 1 AND price_type = 'weekday'
+        AND (start_date IS NULL OR start_date <= ?)
+        AND (end_date IS NULL OR end_date >= ?)
+    `).get(roomTypeId, dateStr, dateStr);
+
+    if (weekdayStrategy) {
+      dayPrice = parseFloat(weekdayStrategy.price);
+      priceType = 'weekday';
+    } else {
+      const baseStrategy = db.prepare(`
+        SELECT * FROM price_strategies
+        WHERE room_type_id = ? AND is_active = 1 AND price_type = 'base'
+      `).get(roomTypeId);
+      if (baseStrategy) {
+        dayPrice = parseFloat(baseStrategy.price);
+      }
+    }
+  }
+
+  const specificStrategy = db.prepare(`
+    SELECT * FROM price_strategies
+    WHERE room_type_id = ? AND is_active = 1 AND price_type = 'date'
+      AND start_date <= ? AND end_date >= ?
+  `).get(roomTypeId, dateStr, dateStr);
+
+  if (specificStrategy) {
+    dayPrice = parseFloat(specificStrategy.price);
+    priceType = 'date';
+  }
+
+  dayPrice = Math.round(dayPrice * 100) / 100;
+  const discountedPrice = Math.round(dayPrice * (memberDiscount / 100) * 100) / 100;
+
+  return {
+    date: dateStr,
+    weekday: ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][dow],
+    is_weekend: isWeekend(dateStr),
+    is_holiday: !!matchedHoliday,
+    holiday_name: matchedHoliday?.name || null,
+    holiday_multiplier: matchedHoliday ? parseFloat(matchedHoliday.price_multiplier) : null,
+    price_type: priceType,
+    base_price: basePrice,
+    original_price: dayPrice,
+    discounted_price: discountedPrice
+  };
+}
+
+function calculateStayBreakdown(roomTypeId, startDate, endDate, memberDiscount = 100) {
+  const dates = getDateRange(startDate, endDate);
+  const breakdown = [];
+  let originalTotal = 0;
+  let discountedTotal = 0;
+
+  for (const dateStr of dates) {
+    const rate = calculateDailyRate(roomTypeId, dateStr, memberDiscount);
+    breakdown.push(rate);
+    originalTotal += rate.original_price;
+    discountedTotal += rate.discounted_price;
+  }
+
+  return {
+    nights: dates.length,
+    daily_breakdown: breakdown,
+    original_total: Math.round(originalTotal * 100) / 100,
+    final_total: Math.round(discountedTotal * 100) / 100
+  };
+}
+
+function getMemberDiscount(memberId) {
+  if (!memberId) return { discount: 100, points_rate: 1.0, level: null };
+  const member = db.prepare('SELECT * FROM members WHERE id = ?').get(memberId);
+  if (!member) return { discount: 100, points_rate: 1.0, level: null };
+  const level = db.prepare('SELECT * FROM member_levels WHERE level = ?').get(member.level);
+  if (!level) return { discount: 100, points_rate: 1.0, level: member.level };
+  return {
+    discount: parseFloat(level.discount) || 100,
+    points_rate: parseFloat(level.points_rate) || 1.0,
+    level: member.level
+  };
+}
+
+function getCheckinDetail(checkinId) {
+  const checkin = db.prepare(`
+    SELECT c.*, r.room_no, rt.name as room_type_name, rt.id as room_type_id, rt.base_price,
+           m.name as member_name, m.level as member_level,
+           b.order_no as booking_order_no
+    FROM checkins c
+    LEFT JOIN rooms r ON c.room_id = r.id
+    LEFT JOIN room_types rt ON r.room_type_id = rt.id
+    LEFT JOIN members m ON c.member_id = m.id
+    LEFT JOIN bookings b ON c.booking_id = b.id
+    WHERE c.id = ?
+  `).get(checkinId);
+
+  if (!checkin) return null;
+
+  const bills = db.prepare('SELECT * FROM bills WHERE checkin_id = ? ORDER BY created_at ASC').all(checkinId);
+
+  const depositTotal = bills.filter(b => b.type === 'deposit').reduce((sum, b) => sum + b.amount, 0);
+  const extraTotal = bills.filter(b => b.type === 'extra').reduce((sum, b) => sum + b.amount, 0);
+  const roomTotal = bills.filter(b => b.type === 'room').reduce((sum, b) => sum + b.amount, 0);
+  const refundTotal = bills.filter(b => b.type === 'refund').reduce((sum, b) => sum + b.amount, 0);
+
+  checkin.bills = bills;
+  checkin.balance = {
+    deposit_total: Math.round(depositTotal * 100) / 100,
+    extra_total: Math.round(extraTotal * 100) / 100,
+    room_total: Math.round(roomTotal * 100) / 100,
+    refund_total: Math.round(refundTotal * 100) / 100,
+    net_balance: Math.round((depositTotal - roomTotal - extraTotal - refundTotal) * 100) / 100
+  };
+
+  return checkin;
+}
+
+function getCheckins(req, res) {
+  try {
+    const { status, room_no, start_date, end_date, keyword } = req.query;
+    let sql = `
+      SELECT c.*, r.room_no, rt.name as room_type_name, m.name as member_name
+      FROM checkins c
+      LEFT JOIN rooms r ON c.room_id = r.id
+      LEFT JOIN room_types rt ON r.room_type_id = rt.id
+      LEFT JOIN members m ON c.member_id = m.id
+      WHERE 1=1
+    `;
+    const params = [];
+
+    if (status) {
+      sql += ' AND c.status = ?';
+      params.push(status);
+    }
+    if (room_no) {
+      sql += ' AND r.room_no LIKE ?';
+      params.push(`%${room_no}%`);
+    }
+    if (start_date) {
+      sql += ' AND DATE(c.actual_checkin) >= ?';
+      params.push(start_date);
+    }
+    if (end_date) {
+      sql += ' AND DATE(c.actual_checkin) <= ?';
+      params.push(end_date);
+    }
+    if (keyword) {
+      sql += ' AND (c.guest_name LIKE ? OR c.guest_phone LIKE ? OR r.room_no LIKE ?)';
+      params.push(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`);
+    }
+
+    sql += ' ORDER BY c.id DESC';
+    const checkins = db.prepare(sql).all(...params);
+    res.json(success({ list: checkins }, '获取入住单列表成功'));
+  } catch (err) {
+    res.json(error('获取入住单列表失败: ' + err.message));
+  }
+}
+
+function getCheckinDetailById(req, res) {
+  try {
+    const { id } = req.params;
+    const detail = getCheckinDetail(id);
+    if (!detail) {
+      return res.json(error('入住单不存在', 404));
+    }
+    res.json(success({ checkin: detail }, '获取入住单详情成功'));
+  } catch (err) {
+    res.json(error('获取入住单详情失败: ' + err.message));
+  }
+}
+
+function checkin(req, res) {
+  try {
+    const { booking_id, room_id, guest_name, guest_idcard, guest_phone, member_id, deposit_amount, expected_checkout } = req.body;
+
+    if (!room_id || !guest_name) {
+      return res.json(error('客房和客人姓名不能为空', 400));
+    }
+
+    const room = db.prepare(`
+      SELECT r.*, rt.name as room_type_name, rt.id as room_type_id, rt.base_price
+      FROM rooms r LEFT JOIN room_types rt ON r.room_type_id = rt.id
+      WHERE r.id = ?
+    `).get(room_id);
+    if (!room) {
+      return res.json(error('客房不存在', 404));
+    }
+    if (room.status !== 'available' && room.status !== 'cleaning') {
+      return res.json(error('当前客房不可入住，状态: ' + room.status, 400));
+    }
+
+    let booking = null;
+    if (booking_id) {
+      booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(booking_id);
+      if (!booking) {
+        return res.json(error('关联的预订不存在', 404));
+      }
+      if (booking.status !== 'confirmed') {
+        return res.json(error('预订状态不是已确认，当前状态: ' + booking.status, 400));
+      }
+      if (booking.room_type_id !== room.room_type_id) {
+        return res.json(error('预订房型与入住客房房型不匹配', 400));
+      }
+    }
+
+    const memberInfo = getMemberDiscount(member_id);
+
+    const actualCheckin = now();
+    const checkinDateStr = moment(actualCheckin).format('YYYY-MM-DD');
+    let defaultCheckoutDate = moment(actualCheckin).add(1, 'days').format('YYYY-MM-DD');
+
+    if (booking) {
+      defaultCheckoutDate = booking.checkout_date;
+    } else if (expected_checkout) {
+      defaultCheckoutDate = expected_checkout;
+    }
+
+    const firstNightRate = calculateDailyRate(room.room_type_id, checkinDateStr, memberInfo.discount);
+    const calculatedDeposit = deposit_amount !== undefined && deposit_amount !== null
+      ? parseFloat(deposit_amount)
+      : firstNightRate.discounted_price;
+
+    const tx = db.transaction(() => {
+      const result = db.prepare(`
+        INSERT INTO checkins (booking_id, room_id, member_id, guest_name, guest_idcard, guest_phone,
+                              actual_checkin, actual_checkout, deposit_amount, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        booking_id || null,
+        room_id,
+        member_id || null,
+        guest_name,
+        guest_idcard || null,
+        guest_phone || null,
+        actualCheckin,
+        null,
+        calculatedDeposit,
+        'checked_in'
+      );
+
+      const checkinId = result.lastInsertRowid;
+
+      db.prepare("UPDATE rooms SET status = 'occupied', updated_at = ? WHERE id = ?").run(now(), room_id);
+
+      if (booking_id) {
+        db.prepare("UPDATE bookings SET status = 'checked_in' WHERE id = ?").run(booking_id);
+
+        if (member_id) {
+          const pendingPoints = db.prepare(`
+            SELECT * FROM points_records
+            WHERE member_id = ? AND type = 'pending' AND order_no = ?
+          `).all(member_id, booking.order_no);
+
+          for (const pr of pendingPoints) {
+            db.prepare(`
+              UPDATE points_records SET type = 'earn', description = ?
+              WHERE id = ?
+            `).run(`入住消费积分（预订 ${booking.order_no}）`, pr.id);
+          }
+        }
+      }
+
+      if (calculatedDeposit > 0) {
+        db.prepare(`
+          INSERT INTO bills (checkin_id, booking_id, type, amount, description)
+          VALUES (?, ?, 'deposit', ?, ?)
+        `).run(checkinId, booking_id || null, calculatedDeposit, '入住押金');
+      }
+
+      return checkinId;
+    });
+
+    const checkinId = tx();
+    const detail = getCheckinDetail(checkinId);
+    res.json(success({ checkin: detail }, '办理入住成功'));
+  } catch (err) {
+    res.json(error('办理入住失败: ' + err.message));
+  }
+}
+
+function extendStay(req, res) {
+  try {
+    const { id } = req.params;
+    const { new_checkout_date } = req.body;
+
+    if (!new_checkout_date) {
+      return res.json(error('新离店日期不能为空', 400));
+    }
+
+    const existing = db.prepare(`
+      SELECT c.*, r.room_no, rt.id as room_type_id
+      FROM checkins c
+      LEFT JOIN rooms r ON c.room_id = r.id
+      LEFT JOIN room_types rt ON r.room_type_id = rt.id
+      WHERE c.id = ?
+    `).get(id);
+
+    if (!existing) {
+      return res.json(error('入住单不存在', 404));
+    }
+    if (existing.status !== 'checked_in' && existing.status !== 'extended') {
+      return res.json(error('当前入住状态不允许续住，状态: ' + existing.status, 400));
+    }
+
+    const currentCheckout = existing.actual_checkout
+      ? moment(existing.actual_checkout)
+      : moment(existing.actual_checkin).add(1, 'days');
+
+    const newCheckout = moment(new_checkout_date);
+    if (newCheckout.isSameOrBefore(currentCheckout, 'day')) {
+      return res.json(error('新离店日期必须晚于当前离店日期', 400));
+    }
+
+    const extendStart = currentCheckout.format('YYYY-MM-DD');
+    const extendEnd = newCheckout.format('YYYY-MM-DD');
+
+    const conflictBooking = db.prepare(`
+      SELECT br.* FROM bookings_rooms br
+      JOIN bookings b ON br.booking_id = b.id
+      WHERE br.room_id = ?
+        AND b.status IN ('confirmed', 'pending')
+        AND b.checkin_date < ?
+        AND b.checkout_date > ?
+      LIMIT 1
+    `).get(existing.room_id, extendEnd, extendStart);
+
+    if (conflictBooking) {
+      return res.json(error('续住期间该客房已被预订占用', 400));
+    }
+
+    const memberInfo = getMemberDiscount(existing.member_id);
+    const breakdown = calculateStayBreakdown(existing.room_type_id, extendStart, extendEnd, memberInfo.discount);
+
+    if (breakdown.nights === 0) {
+      return res.json(error('续住天数计算异常', 400));
+    }
+
+    const tx = db.transaction(() => {
+      db.prepare(`
+        UPDATE checkins SET actual_checkout = ?, status = 'extended'
+        WHERE id = ?
+      `).run(newCheckout.toISOString(), id);
+
+      db.prepare(`
+        INSERT INTO bills (checkin_id, booking_id, type, amount, description)
+        VALUES (?, ?, 'room', ?, ?)
+      `).run(
+        id,
+        existing.booking_id || null,
+        breakdown.final_total,
+        `续住房费 (${extendStart} 至 ${extendEnd}，共${breakdown.nights}晚)`
+      );
+
+      if (existing.member_id && breakdown.final_total > 0) {
+        const extraPoints = Math.floor(breakdown.final_total * memberInfo.points_rate);
+        if (extraPoints > 0) {
+          db.prepare(`
+            UPDATE members SET points = points + ?, total_spent = total_spent + ?
+            WHERE id = ?
+          `).run(extraPoints, breakdown.final_total, existing.member_id);
+
+          db.prepare(`
+            INSERT INTO points_records (member_id, type, points, description)
+            VALUES (?, 'earn', ?, ?)
+          `).run(existing.member_id, extraPoints, `续住消费积分（${breakdown.nights}晚）`);
+        }
+      }
+
+      return breakdown;
+    });
+
+    const result = tx();
+    const detail = getCheckinDetail(id);
+    detail.extend_breakdown = result;
+    res.json(success({ checkin: detail }, '续住成功'));
+  } catch (err) {
+    res.json(error('续住失败: ' + err.message));
+  }
+}
+
+function checkout(req, res) {
+  try {
+    const { id } = req.params;
+    const { actual_checkout_date } = req.body;
+
+    const existing = db.prepare(`
+      SELECT c.*, r.room_no, rt.id as room_type_id, rt.base_price,
+             m.name as member_name, m.level as member_level, m.points as member_points
+      FROM checkins c
+      LEFT JOIN rooms r ON c.room_id = r.id
+      LEFT JOIN room_types rt ON r.room_type_id = rt.id
+      LEFT JOIN members m ON c.member_id = m.id
+      WHERE c.id = ?
+    `).get(id);
+
+    if (!existing) {
+      return res.json(error('入住单不存在', 404));
+    }
+    if (existing.status !== 'checked_in' && existing.status !== 'extended') {
+      return res.json(error('当前入住状态不允许退房，状态: ' + existing.status, 400));
+    }
+
+    const checkinDate = moment(existing.actual_checkin);
+    let checkoutDate = actual_checkout_date ? moment(actual_checkout_date) : moment();
+
+    if (checkoutDate.isSameOrBefore(checkinDate, 'day')) {
+      checkoutDate = moment(checkinDate).add(1, 'days');
+    }
+
+    const checkinDateStr = checkinDate.format('YYYY-MM-DD');
+    const checkoutDateStr = checkoutDate.format('YYYY-MM-DD');
+    const actualNights = checkoutDate.diff(checkinDate, 'days') || 1;
+
+    const memberInfo = getMemberDiscount(existing.member_id);
+    const roomBreakdown = calculateStayBreakdown(existing.room_type_id, checkinDateStr, checkoutDateStr, memberInfo.discount);
+
+    const allBills = db.prepare('SELECT * FROM bills WHERE checkin_id = ?').all(id);
+    const depositTotal = allBills.filter(b => b.type === 'deposit').reduce((sum, b) => sum + b.amount, 0);
+    const extraCharges = allBills.filter(b => b.type === 'extra');
+    const extraTotal = extraCharges.reduce((sum, b) => sum + b.amount, 0);
+    const existingRoomCharges = allBills.filter(b => b.type === 'room');
+    const existingRoomTotal = existingRoomCharges.reduce((sum, b) => sum + b.amount, 0);
+
+    const finalRoomCharge = roomBreakdown.final_total;
+    const additionalRoomCharge = Math.max(0, Math.round((finalRoomCharge - existingRoomTotal) * 100) / 100);
+
+    const totalConsumption = Math.round((finalRoomCharge + extraTotal) * 100) / 100;
+    let refundAmount = Math.round((depositTotal - totalConsumption) * 100) / 100;
+    let finalPayable = refundAmount < 0 ? Math.abs(refundAmount) : 0;
+    if (refundAmount < 0) refundAmount = 0;
+
+    const itemizedList = [];
+
+    for (const day of roomBreakdown.daily_breakdown) {
+      let itemDesc = '房费';
+      if (day.is_holiday && day.holiday_name) {
+        itemDesc = `房费(${day.holiday_name})`;
+      } else if (day.is_weekend) {
+        itemDesc = '房费(周末)';
+      }
+      itemizedList.push({
+        date: day.date,
+        item: itemDesc,
+        unit_price: day.discounted_price,
+        quantity: 1,
+        amount: day.discounted_price,
+        type: 'room',
+        note: day.price_type
+      });
+    }
+
+    for (const extra of extraCharges) {
+      itemizedList.push({
+        date: moment(extra.created_at).format('YYYY-MM-DD'),
+        item: extra.description || '杂费',
+        unit_price: extra.amount,
+        quantity: 1,
+        amount: extra.amount,
+        type: 'extra',
+        note: extra.id
+      });
+    }
+
+    const tx = db.transaction(() => {
+      if (additionalRoomCharge > 0) {
+        db.prepare(`
+          INSERT INTO bills (checkin_id, booking_id, type, amount, description)
+          VALUES (?, ?, 'room', ?, ?)
+        `).run(
+          id,
+          existing.booking_id || null,
+          additionalRoomCharge,
+          `退房核算房费差额 (${actualNights}晚)`
+        );
+      }
+
+      if (refundAmount > 0) {
+        db.prepare(`
+          INSERT INTO bills (checkin_id, booking_id, type, amount, description)
+          VALUES (?, ?, 'refund', ?, ?)
+        `).run(id, existing.booking_id || null, refundAmount, '退房退还押金');
+      }
+
+      db.prepare(`
+        UPDATE checkins
+        SET status = 'checked_out', actual_checkout = ?
+        WHERE id = ?
+      `).run(checkoutDate.toISOString(), id);
+
+      db.prepare("UPDATE rooms SET status = 'cleaning', last_cleaned_at = ?, updated_at = ? WHERE id = ?")
+        .run(now(), now(), existing.room_id);
+
+      if (existing.booking_id) {
+        db.prepare("UPDATE bookings SET status = 'checked_out' WHERE id = ?").run(existing.booking_id);
+      }
+
+      if (existing.member_id && totalConsumption > 0) {
+        const earnedPoints = Math.floor(finalRoomCharge * memberInfo.points_rate);
+        if (earnedPoints > 0) {
+          db.prepare(`
+            UPDATE members SET points = points + ?, total_spent = total_spent + ?
+            WHERE id = ?
+          `).run(earnedPoints, totalConsumption, existing.member_id);
+
+          db.prepare(`
+            INSERT INTO points_records (member_id, type, points, description)
+            VALUES (?, 'earn', ?, ?)
+          `).run(existing.member_id, earnedPoints, `退房结算积分（${actualNights}晚，消费${totalConsumption}元）`);
+        }
+
+        const memberAfter = db.prepare('SELECT total_spent FROM members WHERE id = ?').get(existing.member_id);
+        if (memberAfter) {
+          const newLevel = db.prepare(`
+            SELECT level FROM member_levels
+            WHERE min_spent <= ?
+            ORDER BY min_spent DESC LIMIT 1
+          `).get(memberAfter.total_spent);
+          if (newLevel && newLevel.level !== existing.member_level) {
+            db.prepare('UPDATE members SET level = ? WHERE id = ?').run(newLevel.level, existing.member_id);
+          }
+        }
+      }
+    });
+
+    tx();
+
+    const settlement = {
+      checkin_id: id,
+      guest_name: existing.guest_name,
+      room_no: existing.room_no,
+      checkin_date: checkinDateStr,
+      checkout_date: checkoutDateStr,
+      actual_nights: actualNights,
+      total_room_charge: finalRoomCharge,
+      total_extra_charges: Math.round(extraTotal * 100) / 100,
+      total_consumption: totalConsumption,
+      deposit_paid: Math.round(depositTotal * 100) / 100,
+      refund_amount: refundAmount,
+      final_payable: finalPayable,
+      itemized_list: itemizedList,
+      member_points_earned: existing.member_id ? Math.floor(finalRoomCharge * memberInfo.points_rate) : 0,
+      member_level: memberInfo.level
+    };
+
+    res.json(success({ settlement }, '退房结算成功'));
+  } catch (err) {
+    res.json(error('退房结算失败: ' + err.message));
+  }
+}
+
+function addCharge(req, res) {
+  try {
+    const { id } = req.params;
+    const { type, amount, description } = req.body;
+
+    const validTypes = ['餐饮', '洗衣', '电话', '物品赔偿', '其他'];
+    if (!type || !validTypes.includes(type)) {
+      return res.json(error('杂费类型无效，允许值: ' + validTypes.join('/'), 400));
+    }
+    if (!amount || isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+      return res.json(error('杂费金额必须为正数', 400));
+    }
+
+    const existing = db.prepare('SELECT * FROM checkins WHERE id = ?').get(id);
+    if (!existing) {
+      return res.json(error('入住单不存在', 404));
+    }
+    if (existing.status === 'checked_out') {
+      return res.json(error('该入住单已退房，无法添加杂费', 400));
+    }
+
+    const chargeAmount = Math.round(parseFloat(amount) * 100) / 100;
+    const desc = description || `${type}消费`;
+
+    const tx = db.transaction(() => {
+      db.prepare(`
+        INSERT INTO bills (checkin_id, booking_id, type, amount, description)
+        VALUES (?, ?, 'extra', ?, ?)
+      `).run(id, existing.booking_id || null, chargeAmount, `${type} - ${desc}`);
+
+      if (existing.member_id && chargeAmount > 0) {
+        const memberInfo = getMemberDiscount(existing.member_id);
+        const extraPoints = Math.floor(chargeAmount * memberInfo.points_rate);
+        if (extraPoints > 0) {
+          db.prepare('UPDATE members SET points = points + ?, total_spent = total_spent + ? WHERE id = ?')
+            .run(extraPoints, chargeAmount, existing.member_id);
+          db.prepare(`
+            INSERT INTO points_records (member_id, type, points, description)
+            VALUES (?, 'earn', ?, ?)
+          `).run(existing.member_id, extraPoints, `${type}消费积分`);
+        }
+      }
+    });
+
+    tx();
+    const detail = getCheckinDetail(id);
+    res.json(success({ checkin: detail }, `添加${type}杂费成功`));
+  } catch (err) {
+    res.json(error('添加杂费失败: ' + err.message));
+  }
+}
+
+function addDeposit(req, res) {
+  try {
+    const { id } = req.params;
+    const { amount, description } = req.body;
+
+    if (!amount || isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+      return res.json(error('押金金额必须为正数', 400));
+    }
+
+    const existing = db.prepare('SELECT * FROM checkins WHERE id = ?').get(id);
+    if (!existing) {
+      return res.json(error('入住单不存在', 404));
+    }
+    if (existing.status === 'checked_out') {
+      return res.json(error('该入住单已退房，无法补交押金', 400));
+    }
+
+    const depositAmount = Math.round(parseFloat(amount) * 100) / 100;
+    const desc = description || '补交押金';
+
+    const tx = db.transaction(() => {
+      db.prepare(`
+        INSERT INTO bills (checkin_id, booking_id, type, amount, description)
+        VALUES (?, ?, 'deposit', ?, ?)
+      `).run(id, existing.booking_id || null, depositAmount, desc);
+
+      db.prepare('UPDATE checkins SET deposit_amount = deposit_amount + ? WHERE id = ?')
+        .run(depositAmount, id);
+    });
+
+    tx();
+    const detail = getCheckinDetail(id);
+    res.json(success({ checkin: detail }, '补交押金成功'));
+  } catch (err) {
+    res.json(error('补交押金失败: ' + err.message));
+  }
+}
+
+module.exports = {
+  getCheckins,
+  getCheckinDetailById,
+  checkin,
+  extendStay,
+  checkout,
+  addCharge,
+  addDeposit
+};
