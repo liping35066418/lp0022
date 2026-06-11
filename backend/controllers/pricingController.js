@@ -1,15 +1,9 @@
 const { db } = require('../database');
 const { success, error } = require('../utils/response');
 const moment = require('moment');
+const { calculateCompletePrice, getActiveStrategies, calculateDailyRate } = require('../services/pricingService');
 
 const now = () => new Date().toISOString();
-
-const WEEKEND_RATE_DEFAULT = 120;
-
-function isWeekend(dateStr) {
-  const day = moment(dateStr).day();
-  return day === 0 || day === 6;
-}
 
 function parseJSON(val) {
   if (!val) return [];
@@ -98,7 +92,7 @@ function batchCreatePriceStrategies(req, res) {
 
 function calculatePrice(req, res) {
   try {
-    const { room_type_id, start_date, end_date, member_level_id, member_id, nights } = req.query;
+    const { room_type_id, start_date, end_date, member_id, room_count = 1, points_to_use } = req.query;
 
     if (!room_type_id || !start_date || !end_date) {
       return res.json(error('房型ID、入住日期和离店日期不能为空', 400));
@@ -109,141 +103,55 @@ function calculatePrice(req, res) {
       return res.json(error('房型不存在', 404));
     }
 
-    const start = moment(start_date);
-    const end = moment(end_date);
-    let nightCount = nights ? parseInt(nights) : end.diff(start, 'days');
-    if (nightCount <= 0) {
-      nightCount = 1;
+    const result = calculateCompletePrice(
+      parseInt(room_type_id),
+      start_date,
+      end_date,
+      member_id ? parseInt(member_id) : null,
+      parseInt(room_count) || 1,
+      points_to_use ? parseInt(points_to_use) : null
+    );
+
+    result.room_type = {
+      id: roomType.id,
+      name: roomType.name,
+      base_price: parseFloat(roomType.base_price)
+    };
+
+    res.json(success(result));
+  } catch (err) {
+    res.json(error('计算房价失败: ' + err.message));
+  }
+}
+
+function getCalendarPrices(req, res) {
+  try {
+    const { room_type_id, year, month } = req.query;
+
+    if (!room_type_id) {
+      return res.json(error('房型ID不能为空', 400));
     }
 
-    let memberDiscount = 100;
-    let memberLevel = null;
-
-    if (member_id) {
-      const member = db.prepare('SELECT * FROM members WHERE id = ?').get(member_id);
-      if (member && member.level_id) {
-        memberLevel = db.prepare('SELECT * FROM member_levels WHERE id = ? AND is_active = 1').get(member.level_id);
-        if (memberLevel) {
-          memberDiscount = parseFloat(memberLevel.discount) || 100;
-        }
-      }
-    } else if (member_level_id) {
-      memberLevel = db.prepare('SELECT * FROM member_levels WHERE id = ? AND is_active = 1').get(member_level_id);
-      if (memberLevel) {
-        memberDiscount = parseFloat(memberLevel.discount) || 100;
-      }
+    const roomType = db.prepare('SELECT * FROM room_types WHERE id = ?').get(room_type_id);
+    if (!roomType) {
+      return res.json(error('房型不存在', 404));
     }
 
-    const dateArray = [];
-    for (let i = 0; i < nightCount; i++) {
-      dateArray.push(moment(start).add(i, 'days').format('YYYY-MM-DD'));
+    const targetYear = parseInt(year) || moment().year();
+    const targetMonth = parseInt(month) || moment().month() + 1;
+
+    const startDate = moment([targetYear, targetMonth - 1, 1]).format('YYYY-MM-DD');
+    const endDate = moment([targetYear, targetMonth - 1, 1]).endOf('month').format('YYYY-MM-DD');
+
+    const strategies = getActiveStrategies(parseInt(room_type_id), startDate, endDate);
+    const calendarDays = [];
+
+    const daysInMonth = moment([targetYear, targetMonth - 1, 1]).daysInMonth();
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dateStr = moment([targetYear, targetMonth - 1, d]).format('YYYY-MM-DD');
+      const rate = calculateDailyRate(parseInt(room_type_id), dateStr, strategies, 100);
+      calendarDays.push(rate);
     }
-
-    const strategies = db.prepare(`
-      SELECT * FROM price_strategies
-      WHERE room_type_id = ? AND is_active = 1
-        AND (start_date IS NULL OR start_date <= ?)
-        AND (end_date IS NULL OR end_date >= ?)
-    `).all(room_type_id, end_date, start_date);
-
-    const activeStrategies = strategies.map(s => ({
-      ...s,
-      weekdays: parseJSON(s.weekdays)
-    }));
-
-    const dailyBreakdown = [];
-    let originalTotal = 0;
-    let discountedTotal = 0;
-
-    for (const dateStr of dateArray) {
-      const dow = moment(dateStr).day();
-      const basePrice = parseFloat(roomType.base_price);
-      let dayPrice = basePrice;
-      let priceType = 'base';
-      let matchedHoliday = null;
-      let matchedStrategy = null;
-      let multiplier = 1;
-
-      const holiday = db.prepare(`
-        SELECT * FROM holidays
-        WHERE is_active = 1
-          AND (room_type_id IS NULL OR room_type_id = ?)
-          AND start_date <= ? AND end_date >= ?
-        ORDER BY price_multiplier DESC LIMIT 1
-      `).get(room_type_id, dateStr, dateStr);
-
-      if (holiday) {
-        matchedHoliday = holiday;
-        priceType = 'holiday';
-        multiplier = parseFloat(holiday.price_multiplier) || 1;
-        dayPrice = basePrice * multiplier;
-      } else if (isWeekend(dateStr)) {
-        const weekendStrategy = activeStrategies.find(s =>
-          s.price_type === 'weekend' &&
-          (s.weekdays.length === 0 || s.weekdays.includes(dow))
-        );
-        if (weekendStrategy) {
-          matchedStrategy = weekendStrategy;
-          dayPrice = parseFloat(weekendStrategy.price);
-        } else {
-          multiplier = WEEKEND_RATE_DEFAULT / 100;
-          dayPrice = basePrice * multiplier;
-        }
-        priceType = 'weekend';
-      } else {
-        const weekdayStrategy = activeStrategies.find(s =>
-          s.price_type === 'weekday' &&
-          (s.weekdays.length === 0 || s.weekdays.includes(dow))
-        );
-        if (weekdayStrategy) {
-          matchedStrategy = weekdayStrategy;
-          dayPrice = parseFloat(weekdayStrategy.price);
-          priceType = 'weekday';
-        } else {
-          const baseStrategy = activeStrategies.find(s => s.price_type === 'base');
-          if (baseStrategy) {
-            matchedStrategy = baseStrategy;
-            dayPrice = parseFloat(baseStrategy.price);
-          }
-        }
-      }
-
-      const specificStrategy = activeStrategies.find(s =>
-        s.price_type === 'date' &&
-        s.start_date && s.end_date &&
-        moment(dateStr).isSameOrAfter(s.start_date) &&
-        moment(dateStr).isSameOrBefore(s.end_date)
-      );
-      if (specificStrategy) {
-        matchedStrategy = specificStrategy;
-        dayPrice = parseFloat(specificStrategy.price);
-        priceType = 'date';
-      }
-
-      dayPrice = Math.round(dayPrice * 100) / 100;
-      const discountedDayPrice = Math.round(dayPrice * (memberDiscount / 100) * 100) / 100;
-
-      originalTotal += dayPrice;
-      discountedTotal += discountedDayPrice;
-
-      dailyBreakdown.push({
-        date: dateStr,
-        weekday: ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][dow],
-        is_weekend: isWeekend(dateStr),
-        is_holiday: !!matchedHoliday,
-        holiday_name: matchedHoliday?.name || null,
-        holiday_multiplier: matchedHoliday ? parseFloat(matchedHoliday.price_multiplier) : null,
-        price_type: priceType,
-        base_price: basePrice,
-        original_price: dayPrice,
-        discounted_price: discountedDayPrice,
-        matched_strategy: matchedStrategy ? { id: matchedStrategy.id, name: matchedStrategy.name } : null
-      });
-    }
-
-    originalTotal = Math.round(originalTotal * 100) / 100;
-    discountedTotal = Math.round(discountedTotal * 100) / 100;
-    const discountAmount = Math.round((originalTotal - discountedTotal) * 100) / 100;
 
     res.json(success({
       room_type: {
@@ -251,29 +159,18 @@ function calculatePrice(req, res) {
         name: roomType.name,
         base_price: parseFloat(roomType.base_price)
       },
-      member_level: memberLevel ? {
-        id: memberLevel.id,
-        name: memberLevel.name,
-        discount: parseFloat(memberLevel.discount)
-      } : null,
-      date_range: {
-        start_date,
-        end_date,
-        nights: nightCount
-      },
-      original_total: originalTotal,
-      member_discount_percent: memberDiscount,
-      discount_amount: discountAmount,
-      final_total: discountedTotal,
-      daily_breakdown: dailyBreakdown
+      year: targetYear,
+      month: targetMonth,
+      calendar_days: calendarDays
     }));
   } catch (err) {
-    res.json(error('计算房价失败: ' + err.message));
+    res.json(error('获取日历价格失败: ' + err.message));
   }
 }
 
 module.exports = {
   getPriceStrategies,
   batchCreatePriceStrategies,
-  calculatePrice
+  calculatePrice,
+  getCalendarPrices
 };

@@ -4,6 +4,7 @@ const { authMiddleware, staffMiddleware } = require('../middleware/auth');
 const {
   getCheckins,
   getCheckinDetailById,
+  previewCheckout,
   checkin,
   extendStay,
   checkout,
@@ -13,6 +14,7 @@ const {
 
 router.get('/checkins', authMiddleware, getCheckins);
 router.get('/checkins/:id', authMiddleware, getCheckinDetailById);
+router.get('/checkins/:id/checkout-preview', authMiddleware, staffMiddleware, previewCheckout);
 router.post('/checkins', authMiddleware, staffMiddleware, checkin);
 router.put('/checkins/:id/extend', authMiddleware, staffMiddleware, extendStay);
 router.put('/checkins/:id/checkout', authMiddleware, staffMiddleware, checkout);

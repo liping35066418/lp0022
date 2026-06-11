@@ -1,6 +1,7 @@
 const { db } = require('../database');
 const { success, error } = require('../utils/response');
 const moment = require('moment');
+const { calculateCompletePrice } = require('../services/pricingService');
 
 const now = () => new Date().toISOString();
 
@@ -98,6 +99,18 @@ function checkAvailability(req, res) {
   }
 }
 
+function parsePriceBreakdown(breakdownStr) {
+  if (!breakdownStr) return null;
+  try { return JSON.parse(breakdownStr); } catch (e) { return null; }
+}
+
+function enrichBooking(booking) {
+  if (booking) {
+    booking.price_breakdown = parsePriceBreakdown(booking.price_breakdown);
+  }
+  return booking;
+}
+
 function getBookings(req, res) {
   try {
     const { status, start_date, end_date, member_id, keyword, page = 1, page_size = 20 } = req.query;
@@ -151,6 +164,7 @@ function getBookings(req, res) {
         WHERE br.booking_id = ?
       `).all(b.id);
       b.rooms = rooms;
+      enrichBooking(b);
     });
 
     res.json(success({
@@ -196,6 +210,7 @@ function getBookingDetail(req, res) {
       SELECT * FROM bills WHERE booking_id = ? ORDER BY id
     `).all(id);
 
+    enrichBooking(booking);
     booking.rooms = rooms;
     booking.bills = bills;
 
@@ -203,84 +218,6 @@ function getBookingDetail(req, res) {
   } catch (err) {
     res.json(error('获取预订详情失败: ' + err.message));
   }
-}
-
-function calculateRoomPrice(roomTypeId, checkinDate, checkoutDate, memberId = null) {
-  const roomType = db.prepare('SELECT * FROM room_types WHERE id = ?').get(roomTypeId);
-  if (!roomType) return { total: 0, daily: [] };
-
-  const start = moment(checkinDate);
-  const end = moment(checkoutDate);
-  const nights = end.diff(start, 'days');
-
-  let memberDiscount = 100;
-  if (memberId) {
-    const member = db.prepare('SELECT m.*, ml.discount FROM members m LEFT JOIN member_levels ml ON m.level = ml.level WHERE m.id = ?').get(memberId);
-    if (member && member.discount) {
-      memberDiscount = parseFloat(member.discount);
-    }
-  }
-
-  const daily = [];
-  let total = 0;
-
-  for (let i = 0; i < nights; i++) {
-    const dateStr = moment(start).add(i, 'days').format('YYYY-MM-DD');
-    const dow = moment(dateStr).day();
-    const isWeekend = dow === 0 || dow === 6;
-    let dayPrice = parseFloat(roomType.base_price);
-
-    const holiday = db.prepare(`
-      SELECT * FROM holidays
-      WHERE is_active = 1
-        AND (room_type_id IS NULL OR room_type_id = ?)
-        AND start_date <= ? AND end_date >= ?
-      ORDER BY price_multiplier DESC LIMIT 1
-    `).get(roomTypeId, dateStr, dateStr);
-
-    if (holiday) {
-      dayPrice = dayPrice * (parseFloat(holiday.price_multiplier) || 1);
-    } else if (isWeekend) {
-      const weekendStrategy = db.prepare(`
-        SELECT * FROM price_strategies
-        WHERE room_type_id = ? AND is_active = 1 AND price_type = 'weekend'
-          AND (start_date IS NULL OR start_date <= ?)
-          AND (end_date IS NULL OR end_date >= ?)
-        LIMIT 1
-      `).get(roomTypeId, dateStr, dateStr);
-      if (weekendStrategy) {
-        dayPrice = parseFloat(weekendStrategy.price);
-      } else {
-        dayPrice = dayPrice * 1.2;
-      }
-    } else {
-      const weekdayStrategy = db.prepare(`
-        SELECT * FROM price_strategies
-        WHERE room_type_id = ? AND is_active = 1 AND price_type = 'weekday'
-          AND (start_date IS NULL OR start_date <= ?)
-          AND (end_date IS NULL OR end_date >= ?)
-        LIMIT 1
-      `).get(roomTypeId, dateStr, dateStr);
-      if (weekdayStrategy) {
-        dayPrice = parseFloat(weekdayStrategy.price);
-      } else {
-        const baseStrategy = db.prepare(`
-          SELECT * FROM price_strategies
-          WHERE room_type_id = ? AND is_active = 1 AND price_type = 'base'
-          LIMIT 1
-        `).get(roomTypeId);
-        if (baseStrategy) {
-          dayPrice = parseFloat(baseStrategy.price);
-        }
-      }
-    }
-
-    dayPrice = Math.round(dayPrice * (memberDiscount / 100) * 100) / 100;
-    total += dayPrice;
-    daily.push({ date: dateStr, price: dayPrice });
-  }
-
-  return { total: Math.round(total * 100) / 100, daily };
 }
 
 function createBooking(req, res) {
@@ -291,7 +228,8 @@ function createBooking(req, res) {
       checkin_date,
       checkout_date,
       guest_count,
-      room_ids
+      room_ids,
+      points_to_use
     } = req.body;
 
     if (!room_type_id || !checkin_date || !checkout_date) {
@@ -315,8 +253,6 @@ function createBooking(req, res) {
     }
 
     const tx = db.transaction(() => {
-
-
       const booked = getBookedCountByDateRange(room_type_id, checkin_date, checkout_date);
       const available = roomType.total_rooms - booked;
       const requestedCount = room_ids && room_ids.length > 0 ? room_ids.length : 1;
@@ -366,10 +302,14 @@ function createBooking(req, res) {
         assignedRoomIds = availableRooms.map(r => r.id);
       }
 
-      const priceResult = calculateRoomPrice(room_type_id, checkin_date, checkout_date, member_id);
-      const totalPrice = priceResult.total * assignedRoomIds.length;
-      const perNightPrice = priceResult.daily.length > 0 ? priceResult.daily[0].price : roomType.base_price;
-      const deposit = Math.round(perNightPrice * assignedRoomIds.length * 100) / 100;
+      const priceResult = calculateCompletePrice(
+        room_type_id,
+        checkin_date,
+        checkout_date,
+        member_id || null,
+        assignedRoomIds.length,
+        points_to_use || null
+      );
 
       let orderNo = generateOrderNo();
       let exists = db.prepare('SELECT id FROM bookings WHERE order_no = ?').get(orderNo);
@@ -378,9 +318,15 @@ function createBooking(req, res) {
         exists = db.prepare('SELECT id FROM bookings WHERE order_no = ?').get(orderNo);
       }
 
+      const deposit = Math.round(priceResult.final_total * 0.3 * 100) / 100;
+
       const result = db.prepare(`
-        INSERT INTO bookings (order_no, member_id, room_type_id, checkin_date, checkout_date, guest_count, total_price, deposit, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+        INSERT INTO bookings (
+          order_no, member_id, room_type_id, checkin_date, checkout_date,
+          guest_count, room_count, original_total, discount_amount, discounted_total,
+          points_deducted, points_deduction_amount, total_price, deposit,
+          member_discount_percent, member_level, price_breakdown, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
       `).run(
         orderNo,
         member_id || null,
@@ -388,8 +334,21 @@ function createBooking(req, res) {
         checkin_date,
         checkout_date,
         guest_count || 1,
-        Math.round(totalPrice * 100) / 100,
-        deposit
+        assignedRoomIds.length,
+        priceResult.original_total,
+        priceResult.discount_amount,
+        priceResult.discounted_total,
+        priceResult.points_deduction.points_to_use,
+        priceResult.points_deduction.deduction_amount,
+        priceResult.final_total,
+        deposit,
+        priceResult.member_level?.discount || null,
+        priceResult.member_level?.level || null,
+        JSON.stringify({
+          daily_breakdown: priceResult.daily_breakdown,
+          member_level: priceResult.member_level,
+          points_deduction: priceResult.points_deduction
+        })
       );
 
       const bookingId = result.lastInsertRowid;
@@ -398,25 +357,41 @@ function createBooking(req, res) {
         insertBookingRoom.run(bookingId, roomId);
       }
 
-      let pointsDeducted = 0;
+      if (priceResult.points_deduction.points_to_use > 0 && member_id) {
+        db.prepare('UPDATE members SET points = points - ? WHERE id = ?')
+          .run(priceResult.points_deduction.points_to_use, member_id);
+
+        db.prepare(`
+          INSERT INTO points_records (member_id, type, points, description, order_no, created_at)
+          VALUES (?, 'deducted', ?, ?, ?, ?)
+        `).run(
+          member_id,
+          priceResult.points_deduction.points_to_use,
+          `预订积分抵扣 ${priceResult.points_deduction.deduction_amount.toFixed(2)}元`,
+          orderNo,
+          now()
+        );
+      }
+
       if (member_id) {
-        const member = db.prepare('SELECT m.*, ml.points_rate, ml.exchange_rate FROM members m LEFT JOIN member_levels ml ON m.level = ml.level WHERE m.id = ?').get(member_id);
-        if (member) {
-          const pointsRate = parseFloat(member.points_rate) || 1.0;
-          pointsDeducted = Math.floor(totalPrice * pointsRate);
-          if (member.points >= pointsDeducted) {
-            db.prepare('UPDATE members SET points = points - ? WHERE id = ?').run(pointsDeducted, member_id);
-            db.prepare(`
-              INSERT INTO points_records (member_id, type, points, description, order_no)
-              VALUES (?, 'pending', ?, ?, ?)
-            `).run(member_id, pointsDeducted, '预订预扣积分', orderNo);
-          } else {
-            pointsDeducted = 0;
-          }
+        const memberInfo = db.prepare('SELECT ml.points_rate FROM members m LEFT JOIN member_levels ml ON m.level = ml.level WHERE m.id = ?').get(member_id);
+        const pointsRate = memberInfo?.points_rate || 1.0;
+        const pointsEarned = Math.floor(priceResult.discounted_total * pointsRate);
+        if (pointsEarned > 0) {
+          db.prepare(`
+            INSERT INTO points_records (member_id, type, points, description, order_no, created_at)
+            VALUES (?, 'pending', ?, ?, ?, ?)
+          `).run(
+            member_id,
+            pointsEarned,
+            '预订待确认积分',
+            orderNo,
+            now()
+          );
         }
       }
 
-      return { bookingId, orderNo, totalPrice, deposit, pointsDeducted };
+      return { bookingId, orderNo, priceResult };
     });
 
     const result = tx();
@@ -438,8 +413,9 @@ function createBooking(req, res) {
       WHERE br.booking_id = ?
     `).all(result.bookingId);
 
+    enrichBooking(booking);
     booking.rooms = rooms;
-    booking.points_deducted = result.pointsDeducted;
+    booking.price_result = result.priceResult;
 
     res.json(success({ booking }, '创建预订成功'));
   } catch (err) {
@@ -456,7 +432,8 @@ function updateBooking(req, res) {
       checkin_date,
       checkout_date,
       guest_count,
-      room_ids
+      room_ids,
+      points_to_use
     } = req.body;
 
     const existing = db.prepare('SELECT * FROM bookings WHERE id = ?').get(id);
@@ -483,10 +460,8 @@ function updateBooking(req, res) {
     }
 
     const tx = db.transaction(() => {
-
-
       const booked = getBookedCountByDateRange(newRoomTypeId, newCheckinDate, newCheckoutDate, id);
-      const requestedCount = room_ids && room_ids.length > 0 ? room_ids.length : 1;
+      const requestedCount = room_ids && room_ids.length > 0 ? room_ids.length : existing.room_count;
 
       if (roomType.total_rooms - booked < requestedCount) {
         throw new Error('库存不足，无法修改预订');
@@ -518,11 +493,49 @@ function updateBooking(req, res) {
         }
       }
 
-      const priceResult = calculateRoomPrice(newRoomTypeId, newCheckinDate, newCheckoutDate, newMemberId);
       const roomCount = db.prepare('SELECT COUNT(*) as count FROM bookings_rooms WHERE booking_id = ?').get(id).count;
-      const totalPrice = Math.round(priceResult.total * roomCount * 100) / 100;
-      const perNightPrice = priceResult.daily.length > 0 ? priceResult.daily[0].price : roomType.base_price;
-      const deposit = Math.round(perNightPrice * roomCount * 100) / 100;
+      const priceResult = calculateCompletePrice(
+        newRoomTypeId,
+        newCheckinDate,
+        newCheckoutDate,
+        newMemberId || null,
+        roomCount,
+        points_to_use !== undefined ? points_to_use : existing.points_deducted
+      );
+
+      const existingPointsDeducted = existing.points_deducted || 0;
+      const newPointsDeducted = priceResult.points_deduction.points_to_use;
+      const pointsDiff = newPointsDeducted - existingPointsDeducted;
+
+      if (newMemberId && pointsDiff !== 0) {
+        if (pointsDiff > 0) {
+          db.prepare('UPDATE members SET points = points - ? WHERE id = ?').run(pointsDiff, newMemberId);
+          db.prepare(`
+            INSERT INTO points_records (member_id, type, points, description, order_no, created_at)
+            VALUES (?, 'deducted', ?, ?, ?, ?)
+          `).run(
+            newMemberId,
+            pointsDiff,
+            `修改预订追加积分抵扣 ${(pointsDiff / priceResult.points_deduction.exchange_rate).toFixed(2)}元`,
+            existing.order_no,
+            now()
+          );
+        } else {
+          db.prepare('UPDATE members SET points = points + ? WHERE id = ?').run(-pointsDiff, newMemberId);
+          db.prepare(`
+            INSERT INTO points_records (member_id, type, points, description, order_no, created_at)
+            VALUES (?, 'refund', ?, ?, ?, ?)
+          `).run(
+            newMemberId,
+            -pointsDiff,
+            `修改预订返还积分`,
+            existing.order_no,
+            now()
+          );
+        }
+      }
+
+      const deposit = Math.round(priceResult.final_total * 0.3 * 100) / 100;
 
       db.prepare(`
         UPDATE bookings SET
@@ -531,8 +544,17 @@ function updateBooking(req, res) {
           checkin_date = ?,
           checkout_date = ?,
           guest_count = ?,
+          room_count = ?,
+          original_total = ?,
+          discount_amount = ?,
+          discounted_total = ?,
+          points_deducted = ?,
+          points_deduction_amount = ?,
           total_price = ?,
-          deposit = ?
+          deposit = ?,
+          member_discount_percent = ?,
+          member_level = ?,
+          price_breakdown = ?
         WHERE id = ?
       `).run(
         newMemberId || null,
@@ -540,8 +562,21 @@ function updateBooking(req, res) {
         newCheckinDate,
         newCheckoutDate,
         guest_count !== undefined ? guest_count : existing.guest_count,
-        totalPrice,
+        roomCount,
+        priceResult.original_total,
+        priceResult.discount_amount,
+        priceResult.discounted_total,
+        priceResult.points_deduction.points_to_use,
+        priceResult.points_deduction.deduction_amount,
+        priceResult.final_total,
         deposit,
+        priceResult.member_level?.discount || null,
+        priceResult.member_level?.level || null,
+        JSON.stringify({
+          daily_breakdown: priceResult.daily_breakdown,
+          member_level: priceResult.member_level,
+          points_deduction: priceResult.points_deduction
+        }),
         id
       );
     });
@@ -565,6 +600,7 @@ function updateBooking(req, res) {
       WHERE br.booking_id = ?
     `).all(id);
 
+    enrichBooking(booking);
     booking.rooms = rooms;
 
     res.json(success({ booking }, '修改预订成功'));
@@ -599,8 +635,6 @@ function cancelBooking(req, res) {
     }
 
     const tx = db.transaction(() => {
-
-
       const today = moment().startOf('day');
       const checkin = moment(existing.checkin_date).startOf('day');
       const daysDiff = checkin.diff(today, 'days');
@@ -639,18 +673,30 @@ function cancelBooking(req, res) {
       }
 
       if (existing.member_id) {
-        const pendingPoint = db.prepare(`
+        if (existing.points_deducted > 0) {
+          db.prepare('UPDATE members SET points = points + ? WHERE id = ?')
+            .run(existing.points_deducted, existing.member_id);
+
+          db.prepare(`
+            INSERT INTO points_records (member_id, type, points, description, order_no, created_at)
+            VALUES (?, 'refund', ?, ?, ?, ?)
+          `).run(
+            existing.member_id,
+            existing.points_deducted,
+            '取消预订返还抵扣积分',
+            existing.order_no,
+            now()
+          );
+        }
+
+        const pendingPoints = db.prepare(`
           SELECT * FROM points_records
           WHERE member_id = ? AND order_no = ? AND type = 'pending'
-          ORDER BY id DESC LIMIT 1
-        `).get(existing.member_id, existing.order_no);
+          ORDER BY id DESC
+        `).all(existing.member_id, existing.order_no);
 
-        if (pendingPoint && pendingPoint.points > 0) {
-          db.prepare('UPDATE members SET points = points + ? WHERE id = ?').run(pendingPoint.points, existing.member_id);
-          db.prepare(`
-            INSERT INTO points_records (member_id, type, points, description, order_no)
-            VALUES (?, 'refund', ?, ?, ?)
-          `).run(existing.member_id, pendingPoint.points, '取消预订返还积分', existing.order_no);
+        for (const pr of pendingPoints) {
+          db.prepare('DELETE FROM points_records WHERE id = ?').run(pr.id);
         }
       }
 
@@ -678,6 +724,7 @@ function cancelBooking(req, res) {
 
     const bills = db.prepare('SELECT * FROM bills WHERE booking_id = ? ORDER BY id').all(id);
 
+    enrichBooking(booking);
     booking.rooms = rooms;
     booking.bills = bills;
     booking.cancel_info = {
@@ -719,23 +766,24 @@ function confirmBooking(req, res) {
     }
 
     const tx = db.transaction(() => {
-
-
       db.prepare("UPDATE bookings SET status = 'confirmed' WHERE id = ?").run(id);
 
       if (existing.member_id) {
-        const pendingPoint = db.prepare(`
+        const pendingPoints = db.prepare(`
           SELECT * FROM points_records
           WHERE member_id = ? AND order_no = ? AND type = 'pending'
-          ORDER BY id DESC LIMIT 1
-        `).get(existing.member_id, existing.order_no);
+          ORDER BY id DESC
+        `).all(existing.member_id, existing.order_no);
 
-        if (pendingPoint && pendingPoint.points > 0) {
+        for (const pr of pendingPoints) {
           db.prepare(`
             UPDATE points_records SET type = 'earn', description = ?
             WHERE id = ?
-          `).run('预订确认消费积分', pendingPoint.id);
+          `).run(`预订确认消费积分（预订 ${existing.order_no}）`, pr.id);
         }
+
+        db.prepare('UPDATE members SET points = points + ? WHERE id = ?')
+          .run(pendingPoints.reduce((sum, p) => sum + p.points, 0), existing.member_id);
       }
     });
 
@@ -758,6 +806,7 @@ function confirmBooking(req, res) {
       WHERE br.booking_id = ?
     `).all(id);
 
+    enrichBooking(booking);
     booking.rooms = rooms;
 
     res.json(success({ booking }, '确认预订成功'));

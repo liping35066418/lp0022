@@ -142,10 +142,10 @@
                     <div class="value discount">-¥{{ priceInfo.discount_amount?.toFixed(2) }}</div>
                   </div>
                 </el-col>
-                <el-col :span="6">
+                <el-col :span="6" v-if="priceInfo.points_deduction?.deduction_amount > 0">
                   <div class="summary-item">
-                    <div class="label">间夜数</div>
-                    <div class="value">{{ nights }}晚 × {{ step1.quantity }}间</div>
+                    <div class="label">积分抵扣</div>
+                    <div class="value points">-¥{{ priceInfo.points_deduction?.deduction_amount?.toFixed(2) }}</div>
                   </div>
                 </el-col>
                 <el-col :span="6">
@@ -155,6 +155,35 @@
                   </div>
                 </el-col>
               </el-row>
+            </div>
+
+            <div v-if="selectedMember && priceInfo?.points_deduction" class="points-section">
+              <el-divider content-position="left">积分抵扣</el-divider>
+              <div class="points-info">
+                <div class="points-row">
+                  <span class="points-label">当前积分：</span>
+                  <span class="points-value">{{ selectedMember.points?.toLocaleString() || 0 }} 积分</span>
+                </div>
+                <div class="points-row">
+                  <span class="points-label">兑换比例：</span>
+                  <span class="points-value">{{ priceInfo.points_deduction.exchange_rate }} 积分 = ¥1</span>
+                </div>
+                <div class="points-row">
+                  <span class="points-label">抵扣上限：</span>
+                  <span class="points-value">{{ priceInfo.points_deduction.max_deduction_percent }}%（最多抵扣 ¥{{ priceInfo.points_deduction.max_deduction_amount?.toFixed(2) }}）</span>
+                </div>
+                <div class="points-row points-use">
+                  <span class="points-label">使用积分：</span>
+                  <el-input-number
+                    v-model="pointsToUse"
+                    :min="0"
+                    :max="priceInfo.points_deduction.max_points"
+                    :step="priceInfo.points_deduction.exchange_rate"
+                    @change="onPointsChange"
+                  />
+                  <span class="points-tip">（可抵扣 ¥{{ (pointsToUse / priceInfo.points_deduction.exchange_rate).toFixed(2) }}）</span>
+                </div>
+              </div>
             </div>
 
             <el-table :data="dailyList" border stripe size="small" v-if="dailyList.length">
@@ -240,7 +269,16 @@
               {{ selectedMember ? selectedMember.name + '(' + getLevelName(selectedMember.level) + ')' : '散客' }}
             </el-descriptions-item>
             <el-descriptions-item label="押金">¥{{ step2.deposit?.toFixed(2) }}</el-descriptions-item>
-            <el-descriptions-item label="房费合计" :span="2">
+            <el-descriptions-item label="原价合计" v-if="priceInfo">
+              <span class="original-price">¥{{ priceInfo.original_total?.toFixed(2) }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="会员优惠" v-if="priceInfo?.discount_amount > 0">
+              <span class="discount-price">-¥{{ priceInfo.discount_amount?.toFixed(2) }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="积分抵扣" v-if="priceInfo?.points_deduction?.deduction_amount > 0">
+              <span class="points-price">-¥{{ priceInfo.points_deduction?.deduction_amount?.toFixed(2) }}（{{ priceInfo.points_deduction?.points_to_use }}积分）</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="应付合计" :span="2">
               <span class="final-price">¥{{ finalTotal?.toFixed(2) }}</span>
             </el-descriptions-item>
           </el-descriptions>
@@ -279,6 +317,7 @@ const priceInfo = ref(null)
 
 const selectedMember = ref(null)
 const memberDiscount = ref(100)
+const pointsToUse = ref(0)
 
 const step1Ref = ref(null)
 const step3Ref = ref(null)
@@ -332,8 +371,7 @@ const dailyList = computed(() => {
 
 const finalTotal = computed(() => {
   if (!priceInfo.value) return 0
-  const base = selectedMember.value ? priceInfo.value.final_total : priceInfo.value.original_total
-  return Math.round(base * step1.quantity * 100) / 100
+  return priceInfo.value.final_total || 0
 })
 
 function disabledCheckinDate(date) {
@@ -368,6 +406,7 @@ function onRoomTypeChange() {
 }
 
 function onMemberChange(id) {
+  pointsToUse.value = 0
   if (!id) {
     selectedMember.value = null
     memberDiscount.value = 100
@@ -376,6 +415,10 @@ function onMemberChange(id) {
     selectedMember.value = m || null
     memberDiscount.value = m?.discount ? (m.discount / 10).toFixed(1) : 100
   }
+  calculatePrice()
+}
+
+function onPointsChange() {
   calculatePrice()
 }
 
@@ -411,9 +454,10 @@ async function calculatePrice() {
       room_type_id: step1.roomTypeId,
       start_date: step1.checkinDate,
       end_date: step1.checkoutDate,
-      nights: nights.value
+      room_count: step1.quantity
     }
     if (step2.memberId) params.member_id = step2.memberId
+    if (pointsToUse.value > 0) params.points_to_use = pointsToUse.value
     const res = await request.get('/price-strategies/calculate', { params })
     priceInfo.value = res.data
     if (priceInfo.value?.member_level) {
@@ -466,8 +510,14 @@ async function submitBooking() {
       checkin_date: step1.checkinDate,
       checkout_date: step1.checkoutDate,
       guest_count: step1.guestCount,
+      room_count: step1.quantity,
       total_price: finalTotal.value,
-      deposit: step2.deposit
+      deposit: step2.deposit,
+      points_to_use: pointsToUse.value > 0 ? pointsToUse.value : null,
+      guest_name: step3.guestName,
+      guest_phone: step3.guestPhone,
+      guest_idcard: step3.guestIdcard,
+      remark: step3.remark
     })
     ElMessage.success('预订创建成功')
     router.push('/bookings')
@@ -579,6 +629,10 @@ onMounted(() => {
   color: #67c23a;
 }
 
+.summary-item .value.points {
+  color: #e6a23c;
+}
+
 .summary-item .value.final {
   color: #f56c6c;
   font-size: 22px;
@@ -630,5 +684,55 @@ onMounted(() => {
 
 .step-footer .el-button {
   min-width: 110px;
+}
+
+.points-section {
+  margin-top: 8px;
+}
+
+.points-info {
+  background: #fafafa;
+  border-radius: 8px;
+  padding: 16px 20px;
+}
+
+.points-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 14px;
+}
+
+.points-row:last-child {
+  margin-bottom: 0;
+}
+
+.points-label {
+  color: #606266;
+  min-width: 80px;
+}
+
+.points-value {
+  color: #303133;
+  font-weight: 500;
+}
+
+.points-use {
+  flex-wrap: wrap;
+}
+
+.points-tip {
+  color: #909399;
+  font-size: 13px;
+}
+
+.original-price {
+  text-decoration: line-through;
+  color: #c0c4cc;
+}
+
+.points-price {
+  color: #e6a23c;
 }
 </style>

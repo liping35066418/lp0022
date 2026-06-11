@@ -7,7 +7,7 @@
         <el-tab-pane label="房价日历" name="calendar">
           <div class="calendar-toolbar">
             <div class="toolbar-left">
-              <el-select v-model="selectedRoomType" placeholder="选择房型" style="width: 200px" @change="loadCalendar">
+              <el-select v-model="selectedRoomType" placeholder="选择房型" style="width: 200px" @change="onRoomTypeChange">
                 <el-option
                   v-for="rt in roomTypes"
                   :key="rt.id"
@@ -41,7 +41,7 @@
             </div>
           </div>
 
-          <div class="calendar-grid">
+          <div class="calendar-grid" v-loading="calendarLoading">
             <div class="calendar-weekdays">
               <div v-for="w in weekdays" :key="w" class="weekday-cell">{{ w }}</div>
             </div>
@@ -236,11 +236,13 @@ import request from '@/api'
 const loading = ref(false)
 const submitting = ref(false)
 const holidayLoading = ref(false)
+const calendarLoading = ref(false)
 const activeTab = ref('calendar')
 
 const roomTypes = ref([])
 const holidays = ref([])
 const selectedRoomType = ref('')
+const calendarPrices = ref([])
 
 const currentDate = ref(dayjs())
 const weekdays = ['日', '一', '二', '三', '四', '五', '六']
@@ -297,6 +299,11 @@ const calendarCells = computed(() => {
   const rt = roomTypes.value.find(r => r.id === selectedRoomType.value)
   const basePrice = rt?.base_price || 0
 
+  const priceMap = {}
+  calendarPrices.value.forEach(p => {
+    priceMap[p.date] = p
+  })
+
   const prevMonth = startOfMonth.subtract(1, 'month')
   const prevDays = prevMonth.daysInMonth()
   for (let i = startDay - 1; i >= 0; i--) {
@@ -324,19 +331,20 @@ const calendarCells = computed(() => {
       const ed = h.end_date || h.date
       return dateStr >= sd && dateStr <= ed && h.is_active
     })
+    const dayPrice = priceMap[dateStr]
     cells.push({
       date: dateStr,
       day: d,
       weekday: dateObj.day(),
       inMonth: true,
       isToday: dateStr === today,
-      isWeekend: [0, 6].includes(dateObj.day()),
-      isHoliday: !!holiday,
-      holidayName: holiday?.name || '',
-      price: holiday
+      isWeekend: dayPrice?.is_weekend || [0, 6].includes(dateObj.day()),
+      isHoliday: dayPrice?.is_holiday || !!holiday,
+      holidayName: dayPrice?.holiday_name || holiday?.name || '',
+      price: dayPrice?.original_price ?? (holiday
         ? Math.round(basePrice * (holiday.price_multiplier || holiday.rate_multiplier || 1))
-        : ([0, 6].includes(dateObj.day()) ? Math.round(basePrice * 1.2) : basePrice),
-      hasStrategy: !!holiday
+        : ([0, 6].includes(dateObj.day()) ? Math.round(basePrice * 1.2) : basePrice)),
+      hasStrategy: dayPrice?.has_strategy || !!holiday
     })
   }
 
@@ -368,10 +376,12 @@ function formatDate(dt) {
 
 function prevMonth() {
   currentDate.value = currentDate.value.subtract(1, 'month')
+  loadCalendar()
 }
 
 function nextMonth() {
   currentDate.value = currentDate.value.add(1, 'month')
+  loadCalendar()
 }
 
 async function loadRoomTypes() {
@@ -380,6 +390,7 @@ async function loadRoomTypes() {
     roomTypes.value = res.data?.list || []
     if (roomTypes.value.length && !selectedRoomType.value) {
       selectedRoomType.value = roomTypes.value[0].id
+      loadCalendar()
     }
   } catch (e) {}
 }
@@ -396,7 +407,33 @@ async function loadHolidays() {
   }
 }
 
-async function loadCalendar() {}
+async function loadCalendar() {
+  if (!selectedRoomType.value) {
+    calendarPrices.value = []
+    return
+  }
+  calendarLoading.value = true
+  try {
+    const year = currentDate.value.year()
+    const month = currentDate.value.month() + 1
+    const res = await request.get('/price-strategies/calendar', {
+      params: {
+        room_type_id: selectedRoomType.value,
+        year,
+        month
+      }
+    })
+    calendarPrices.value = res.data?.calendar_days || []
+  } catch (e) {
+    calendarPrices.value = []
+  } finally {
+    calendarLoading.value = false
+  }
+}
+
+function onRoomTypeChange() {
+  loadCalendar()
+}
 
 function openBatchDialog() {
   if (!selectedRoomType.value) {

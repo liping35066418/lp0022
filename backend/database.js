@@ -8,7 +8,7 @@ if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir, { recursive: true });
 }
 
-const dbPath = path.join(dataDir, 'hotel.db');
+const dbPath = process.env.DB_PATH || path.join(dataDir, 'hotel.db');
 const db = new Database(dbPath);
 
 db.pragma('journal_mode = WAL');
@@ -90,10 +90,11 @@ function initDatabase() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       level TEXT NOT NULL UNIQUE,
       name TEXT NOT NULL DEFAULT '',
-      discount REAL NOT NULL DEFAULT 1.0,
+      discount REAL NOT NULL DEFAULT 100,
       min_spent REAL NOT NULL DEFAULT 0,
       points_rate REAL NOT NULL DEFAULT 1.0,
       exchange_rate REAL NOT NULL DEFAULT 100,
+      max_deduction_percent INTEGER NOT NULL DEFAULT 30,
       is_active INTEGER NOT NULL DEFAULT 1
     )
   `;
@@ -120,8 +121,17 @@ function initDatabase() {
       checkin_date DATE NOT NULL,
       checkout_date DATE NOT NULL,
       guest_count INTEGER NOT NULL DEFAULT 1,
+      room_count INTEGER NOT NULL DEFAULT 1,
+      original_total REAL NOT NULL DEFAULT 0,
+      discount_amount REAL NOT NULL DEFAULT 0,
+      discounted_total REAL NOT NULL DEFAULT 0,
+      points_deducted INTEGER NOT NULL DEFAULT 0,
+      points_deduction_amount REAL NOT NULL DEFAULT 0,
       total_price REAL NOT NULL,
       deposit REAL NOT NULL DEFAULT 0,
+      member_discount_percent REAL,
+      member_level TEXT,
+      price_breakdown TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE SET NULL,
@@ -298,17 +308,33 @@ function seedData() {
     const memberLevelCount = db.prepare('SELECT COUNT(*) as count FROM member_levels').get().count;
     if (memberLevelCount === 0) {
       const levels = [
-        { level: 'bronze', name: '普通会员', discount: 0.95, min_spent: 0, points_rate: 1.0, exchange_rate: 100 },
-        { level: 'silver', name: '银卡会员', discount: 0.90, min_spent: 5000, points_rate: 1.5, exchange_rate: 100 },
-        { level: 'gold', name: '金卡会员', discount: 0.85, min_spent: 20000, points_rate: 2.0, exchange_rate: 100 },
-        { level: 'platinum', name: '铂金会员', discount: 0.80, min_spent: 50000, points_rate: 3.0, exchange_rate: 100 }
+        { level: 'bronze', name: '普通会员', discount: 95, min_spent: 0, points_rate: 1.0, exchange_rate: 100, max_deduction_percent: 20 },
+        { level: 'silver', name: '银卡会员', discount: 90, min_spent: 5000, points_rate: 1.5, exchange_rate: 100, max_deduction_percent: 25 },
+        { level: 'gold', name: '金卡会员', discount: 85, min_spent: 20000, points_rate: 2.0, exchange_rate: 100, max_deduction_percent: 30 },
+        { level: 'platinum', name: '铂金会员', discount: 80, min_spent: 50000, points_rate: 3.0, exchange_rate: 100, max_deduction_percent: 40 }
       ];
 
-      const insertLevel = db.prepare('INSERT INTO member_levels (level, name, discount, min_spent, points_rate, exchange_rate) VALUES (?, ?, ?, ?, ?, ?)');
+      const insertLevel = db.prepare('INSERT INTO member_levels (level, name, discount, min_spent, points_rate, exchange_rate, max_deduction_percent) VALUES (?, ?, ?, ?, ?, ?, ?)');
       for (const l of levels) {
-        insertLevel.run(l.level, l.name, l.discount, l.min_spent, l.points_rate, l.exchange_rate);
+        insertLevel.run(l.level, l.name, l.discount, l.min_spent, l.points_rate, l.exchange_rate, l.max_deduction_percent);
       }
       console.log('种子数据: 4个会员等级创建完成');
+    }
+
+    const memberCount = db.prepare('SELECT COUNT(*) as count FROM members').get().count;
+    if (memberCount === 0) {
+      const members = [
+        { name: '张三', phone: '13800138001', level: 'bronze', points: 5000, total_spent: 3000 },
+        { name: '李四', phone: '13800138002', level: 'silver', points: 12000, total_spent: 8000 },
+        { name: '王五', phone: '13800138003', level: 'gold', points: 35000, total_spent: 25000 },
+        { name: '赵六', phone: '13800138004', level: 'platinum', points: 80000, total_spent: 60000 }
+      ];
+
+      const insertMember = db.prepare('INSERT INTO members (name, phone, level, points, total_spent) VALUES (?, ?, ?, ?, ?)');
+      for (const m of members) {
+        insertMember.run(m.name, m.phone, m.level, m.points, m.total_spent);
+      }
+      console.log('种子数据: 4个会员创建完成');
     }
 
     const holidayCount = db.prepare('SELECT COUNT(*) as count FROM holidays').get().count;

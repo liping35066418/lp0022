@@ -147,13 +147,55 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="checkoutVisible" title="退房结算" width="580px">
-      <div v-if="currentCheckin" class="checkout-content">
+    <el-dialog v-model="checkoutVisible" title="退房结算" width="680px">
+      <div v-if="currentCheckin" class="checkout-content" v-loading="checkoutLoading">
         <el-descriptions :column="2" border size="small">
           <el-descriptions-item label="房号">{{ currentCheckin.room_no }}</el-descriptions-item>
           <el-descriptions-item label="客人">{{ currentCheckin.guest_name }}</el-descriptions-item>
           <el-descriptions-item label="入住时间">{{ formatDateTime(currentCheckin.actual_checkin) }}</el-descriptions-item>
           <el-descriptions-item label="退房时间">{{ formatDateTime(new Date()) }}</el-descriptions-item>
+        </el-descriptions>
+
+        <el-divider content-position="left" v-if="checkoutSettlement">价格校验</el-divider>
+        <el-alert
+          v-if="checkoutSettlement && !checkoutSettlement.daily_price_matches"
+          title="价格校验警告"
+          type="warning"
+          :closable="false"
+          show-icon
+          class="price-alert"
+        >
+          <template #default>
+            检测到部分日期的退房房价与预定时锁定的价格不一致，请仔细核对！
+          </template>
+        </el-alert>
+        <el-alert
+          v-if="checkoutSettlement && checkoutSettlement.daily_price_matches"
+          title="价格校验通过"
+          type="success"
+          :closable="false"
+          show-icon
+          class="price-alert"
+        >
+          <template #default>
+            所有日期的退房房价与预定时锁定的价格完全一致。
+          </template>
+        </el-alert>
+
+        <el-divider content-position="left" v-if="checkoutSettlement">价格明细</el-divider>
+        <el-descriptions :column="2" border size="small" v-if="checkoutSettlement">
+          <el-descriptions-item label="原价合计">
+            <span class="original-price">¥{{ checkoutSettlement.original_total?.toFixed(2) }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="会员折扣" v-if="checkoutSettlement.member_discount_percent">
+            <span class="discount-tag">{{ checkoutSettlement.member_discount_percent }}%（{{ (checkoutSettlement.member_discount_percent / 10).toFixed(1) }}折）</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="会员优惠" v-if="checkoutSettlement.discount_amount > 0">
+            <span class="discount-price">-¥{{ checkoutSettlement.discount_amount?.toFixed(2) }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="积分抵扣" v-if="checkoutSettlement.points_deduction_amount > 0">
+            <span class="points-price">-¥{{ checkoutSettlement.points_deduction_amount?.toFixed(2) }}（{{ checkoutSettlement.points_deducted }}积分）</span>
+          </el-descriptions-item>
         </el-descriptions>
 
         <el-divider content-position="left">消费明细</el-divider>
@@ -164,9 +206,25 @@
             <span>房费明细</span>
           </div>
           <el-table :data="checkoutBill.roomFees" size="small" border>
-            <el-table-column prop="date" label="日期" width="130" />
-            <el-table-column prop="desc" label="说明" />
-            <el-table-column prop="amount" label="金额(元)" width="110" align="right">
+            <el-table-column prop="date" label="日期" width="110" />
+            <el-table-column prop="desc" label="说明" width="120" />
+            <el-table-column label="预订单价(元)" width="110" align="right" v-if="checkoutSettlement">
+              <template #default="{ row }">
+                <span :class="{ 'price-mismatch': !row.matches_booking }">¥{{ row.booking_price?.toFixed(2) }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="结算单价(元)" width="110" align="right" v-if="checkoutSettlement">
+              <template #default="{ row }">
+                <span :class="{ 'price-mismatch': !row.matches_booking }">¥{{ row.unit_price?.toFixed(2) }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="校验" width="70" align="center" v-if="checkoutSettlement">
+              <template #default="{ row }">
+                <el-icon v-if="row.matches_booking" class="icon-success"><CircleCheckFilled /></el-icon>
+                <el-icon v-else class="icon-warning"><WarningFilled /></el-icon>
+              </template>
+            </el-table-column>
+            <el-table-column prop="amount" label="金额(元)" width="100" align="right">
               <template #default="{ row }">¥{{ row.amount?.toFixed(2) }}</template>
             </el-table-column>
           </el-table>
@@ -221,7 +279,7 @@
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Search, OfficeBuilding, Goods } from '@element-plus/icons-vue'
+import { Search, OfficeBuilding, Goods, CircleCheckFilled, WarningFilled } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
 import request from '@/api'
 
@@ -253,6 +311,8 @@ const chargeRules = {
   amount: [{ required: true, message: '请输入金额', trigger: 'blur' }]
 }
 
+const checkoutLoading = ref(false)
+const checkoutSettlement = ref(null)
 const checkoutBill = reactive({
   roomFees: [],
   extraFees: [],
@@ -315,34 +375,86 @@ function openChargeDialog(row) {
   chargeVisible.value = true
 }
 
+function getLevelName(level) {
+  const map = {
+    bronze: '普通会员',
+    silver: '银卡会员',
+    gold: '金卡会员',
+    platinum: '铂金会员'
+  }
+  return map[level] || level
+}
+
 async function openCheckoutDialog(row) {
   currentCheckin.value = row
-  const nights = Math.max(1, dayjs().diff(dayjs(row.actual_checkin), 'day'))
-  const basePrice = 300
-  const roomFees = []
-  for (let i = 0; i < nights; i++) {
-    const d = dayjs(row.actual_checkin).add(i, 'day')
-    roomFees.push({
-      date: d.format('YYYY-MM-DD'),
-      desc: `${row.room_type_name || '客房'}房费`,
-      amount: basePrice
+  checkoutLoading.value = true
+  checkoutSettlement.value = null
+  try {
+    const res = await request.get(`/checkins/${row.id}/checkout-preview`)
+    const settlement = res.data?.settlement
+    checkoutSettlement.value = settlement
+
+    const roomFees = []
+    const extraFees = []
+
+    settlement.itemized_list.forEach(item => {
+      if (item.type === 'room') {
+        roomFees.push({
+          date: item.date,
+          desc: `${row.room_type_name || '客房'}${item.item.replace('房费', '')}`,
+          amount: item.amount,
+          unit_price: item.unit_price,
+          booking_price: item.booking_price,
+          matches_booking: item.matches_booking
+        })
+      } else {
+        extraFees.push({
+          type: item.note,
+          desc: item.item,
+          amount: item.amount
+        })
+      }
     })
+
+    Object.assign(checkoutBill, {
+      roomFees,
+      extraFees,
+      roomTotal: settlement.total_room_charge,
+      extraTotal: settlement.total_extra_charges,
+      grandTotal: settlement.total_consumption,
+      refund: settlement.refund_amount
+    })
+  } catch (e) {
+    ElMessage.error('获取退房结算信息失败')
+    const nights = Math.max(1, dayjs().diff(dayjs(row.actual_checkin), 'day'))
+    const basePrice = 300
+    const roomFees = []
+    for (let i = 0; i < nights; i++) {
+      const d = dayjs(row.actual_checkin).add(i, 'day')
+      roomFees.push({
+        date: d.format('YYYY-MM-DD'),
+        desc: `${row.room_type_name || '客房'}房费`,
+        amount: basePrice
+      })
+    }
+    const roomTotal = basePrice * nights
+    const extraFees = [
+      { type: '餐饮', desc: '餐厅消费', amount: 128 }
+    ]
+    const extraTotal = extraFees.reduce((s, x) => s + x.amount, 0)
+    const grandTotal = roomTotal + extraTotal
+    const deposit = row.deposit_amount || 0
+    Object.assign(checkoutBill, {
+      roomFees,
+      extraFees,
+      roomTotal,
+      extraTotal,
+      grandTotal,
+      refund: deposit - grandTotal
+    })
+  } finally {
+    checkoutLoading.value = false
   }
-  const roomTotal = basePrice * nights
-  const extraFees = [
-    { type: '餐饮', desc: '餐厅消费', amount: 128 }
-  ]
-  const extraTotal = extraFees.reduce((s, x) => s + x.amount, 0)
-  const grandTotal = roomTotal + extraTotal
-  const deposit = row.deposit_amount || 0
-  Object.assign(checkoutBill, {
-    roomFees,
-    extraFees,
-    roomTotal,
-    extraTotal,
-    grandTotal,
-    refund: deposit - grandTotal
-  })
   checkoutVisible.value = true
 }
 
@@ -518,6 +630,43 @@ onMounted(() => {
 }
 
 .summary-row.final.supplement .amount {
+  color: #f56c6c;
+  font-size: 18px;
+}
+
+.price-alert {
+  margin-bottom: 16px;
+}
+
+.original-price {
+  text-decoration: line-through;
+  color: #c0c4cc;
+}
+
+.discount-price {
+  color: #67c23a;
+}
+
+.points-price {
+  color: #e6a23c;
+}
+
+.discount-tag {
+  color: #e6a23c;
+  font-weight: 500;
+}
+
+.price-mismatch {
+  color: #f56c6c;
+  font-weight: 600;
+}
+
+.icon-success {
+  color: #67c23a;
+  font-size: 18px;
+}
+
+.icon-warning {
   color: #f56c6c;
   font-size: 18px;
 }

@@ -57,9 +57,22 @@
         <el-table-column prop="checkin_date" label="入住日期" width="120" />
         <el-table-column prop="checkout_date" label="退房日期" width="120" />
         <el-table-column prop="guest_count" label="人数" width="70" align="center" />
-        <el-table-column prop="total_price" label="金额(元)" width="110" align="right">
+        <el-table-column label="房费明细" width="200" align="right">
           <template #default="{ row }">
-            <span class="price-text">¥{{ row.total_price?.toFixed(2) }}</span>
+            <div class="price-detail-cell">
+              <div v-if="row.original_total && row.original_total !== row.total_price" class="original-line">
+                <span class="original">¥{{ row.original_total?.toFixed(2) }}</span>
+              </div>
+              <div v-if="row.discount_amount > 0" class="discount-line">
+                <span class="discount">-¥{{ row.discount_amount?.toFixed(2) }}优惠</span>
+              </div>
+              <div v-if="row.points_deduction_amount > 0" class="points-line">
+                <span class="points">-¥{{ row.points_deduction_amount?.toFixed(2) }}积分</span>
+              </div>
+              <div class="final-line">
+                <span class="final">¥{{ row.total_price?.toFixed(2) }}</span>
+              </div>
+            </div>
           </template>
         </el-table-column>
         <el-table-column prop="status" label="状态" width="100" align="center">
@@ -91,29 +104,73 @@
       </el-table>
     </el-card>
 
-    <el-dialog v-model="detailVisible" title="预订详情" width="600px">
-      <el-descriptions :column="2" border v-if="currentBooking">
-        <el-descriptions-item label="订单号">{{ currentBooking.order_no }}</el-descriptions-item>
-        <el-descriptions-item label="状态">
-          <el-tag :type="getStatusType(currentBooking.status)" effect="dark">
-            {{ getStatusText(currentBooking.status) }}
-          </el-tag>
-        </el-descriptions-item>
-        <el-descriptions-item label="会员">
-          {{ currentBooking.member_name || '散客' }}
-        </el-descriptions-item>
-        <el-descriptions-item label="房型">{{ currentBooking.room_type_name }}</el-descriptions-item>
-        <el-descriptions-item label="入住日期">{{ currentBooking.checkin_date }}</el-descriptions-item>
-        <el-descriptions-item label="退房日期">{{ currentBooking.checkout_date }}</el-descriptions-item>
-        <el-descriptions-item label="入住人数">{{ currentBooking.guest_count }}人</el-descriptions-item>
-        <el-descriptions-item label="总金额">
-          <span class="price-text">¥{{ currentBooking.total_price?.toFixed(2) }}</span>
-        </el-descriptions-item>
-        <el-descriptions-item label="押金">
-          <span class="price-text">¥{{ currentBooking.deposit?.toFixed(2) }}</span>
-        </el-descriptions-item>
-        <el-descriptions-item label="创建时间">{{ currentBooking.created_at }}</el-descriptions-item>
-      </el-descriptions>
+    <el-dialog v-model="detailVisible" title="预订详情" width="680px">
+      <div v-if="currentBooking">
+        <el-descriptions :column="2" border>
+          <el-descriptions-item label="订单号">{{ currentBooking.order_no }}</el-descriptions-item>
+          <el-descriptions-item label="状态">
+            <el-tag :type="getStatusType(currentBooking.status)" effect="dark">
+              {{ getStatusText(currentBooking.status) }}
+            </el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="会员">
+            {{ currentBooking.member_name || '散客' }}
+            <span v-if="currentBooking.member_level" class="member-level-tag">
+              ({{ getLevelName(currentBooking.member_level) }})
+            </span>
+          </el-descriptions-item>
+          <el-descriptions-item label="房型">{{ currentBooking.room_type_name }}</el-descriptions-item>
+          <el-descriptions-item label="入住日期">{{ currentBooking.checkin_date }}</el-descriptions-item>
+          <el-descriptions-item label="退房日期">{{ currentBooking.checkout_date }}</el-descriptions-item>
+          <el-descriptions-item label="入住人数">{{ currentBooking.guest_count }}人</el-descriptions-item>
+          <el-descriptions-item label="房间数量">{{ currentBooking.room_count || 1 }}间</el-descriptions-item>
+        </el-descriptions>
+
+        <el-divider content-position="left">价格明细</el-divider>
+
+        <el-descriptions :column="2" border size="small">
+          <el-descriptions-item label="原价合计">
+            <span class="original-price">¥{{ currentBooking.original_total?.toFixed(2) }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="会员折扣" v-if="currentBooking.member_discount_percent">
+            <span class="discount-tag">{{ currentBooking.member_discount_percent }}%（{{ (currentBooking.member_discount_percent / 10).toFixed(1) }}折）</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="会员优惠" v-if="currentBooking.discount_amount > 0">
+            <span class="discount-price">-¥{{ currentBooking.discount_amount?.toFixed(2) }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="折扣后金额" v-if="currentBooking.discounted_total">
+            <span>¥{{ currentBooking.discounted_total?.toFixed(2) }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="积分抵扣" v-if="currentBooking.points_deduction_amount > 0">
+            <span class="points-price">-¥{{ currentBooking.points_deduction_amount?.toFixed(2) }}（{{ currentBooking.points_deducted }}积分）</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="应付金额">
+            <span class="final-price">¥{{ currentBooking.total_price?.toFixed(2) }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="押金">
+            <span class="price-text">¥{{ currentBooking.deposit?.toFixed(2) }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="创建时间">{{ currentBooking.created_at }}</el-descriptions-item>
+        </el-descriptions>
+
+        <el-divider content-position="left" v-if="currentBooking.price_breakdown?.daily_breakdown?.length">每日房价明细</el-divider>
+        <el-table :data="currentBooking.price_breakdown?.daily_breakdown || []" size="small" border v-if="currentBooking.price_breakdown?.daily_breakdown?.length">
+          <el-table-column prop="date" label="日期" width="120" />
+          <el-table-column label="类型" width="100" align="center">
+            <template #default="{ row }">
+              <el-tag v-if="row.is_holiday" type="danger" size="small">{{ row.holiday_name || '节假日' }}</el-tag>
+              <el-tag v-else-if="row.is_weekend" type="warning" size="small">周末</el-tag>
+              <el-tag v-else type="info" size="small">平日</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="original_price" label="单价(元)" width="100" align="right" />
+          <el-table-column label="会员价(元)" width="100" align="right" v-if="currentBooking.member_level">
+            <template #default="{ row }">
+              <span class="discount-price">¥{{ row.discounted_price?.toFixed(2) }}</span>
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
       <template #footer>
         <el-button @click="detailVisible = false">关闭</el-button>
       </template>
@@ -160,6 +217,28 @@ function getStatusText(status) {
   return map[status] || status
 }
 
+function getLevelName(level) {
+  const map = {
+    bronze: '普通会员',
+    silver: '银卡会员',
+    gold: '金卡会员',
+    platinum: '铂金会员'
+  }
+  return map[level] || level
+}
+
+function parsePriceBreakdown(booking) {
+  if (!booking) return booking
+  try {
+    if (typeof booking.price_breakdown === 'string') {
+      booking.price_breakdown = JSON.parse(booking.price_breakdown)
+    }
+  } catch (e) {
+    booking.price_breakdown = null
+  }
+  return booking
+}
+
 async function loadBookings() {
   loading.value = true
   try {
@@ -168,6 +247,7 @@ async function loadBookings() {
     if (filters.status) params.status = filters.status
     const res = await request.get('/bookings', { params })
     let list = res.data?.list || []
+    list = list.map(b => parsePriceBreakdown(b))
     if (filters.dateRange && filters.dateRange.length === 2) {
       const [start, end] = filters.dateRange
       list = list.filter(b => b.checkin_date >= start && b.checkout_date <= end)
@@ -188,7 +268,7 @@ function resetFilters() {
 }
 
 function viewDetail(row) {
-  currentBooking.value = row
+  currentBooking.value = parsePriceBreakdown({ ...row })
   detailVisible.value = true
 }
 
@@ -266,5 +346,60 @@ onMounted(() => {
 .price-text {
   color: #f56c6c;
   font-weight: 600;
+}
+
+.price-detail-cell {
+  text-align: right;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.price-detail-cell .original-line .original {
+  text-decoration: line-through;
+  color: #c0c4cc;
+}
+
+.price-detail-cell .discount-line .discount {
+  color: #67c23a;
+}
+
+.price-detail-cell .points-line .points {
+  color: #e6a23c;
+}
+
+.price-detail-cell .final-line .final {
+  color: #f56c6c;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.member-level-tag {
+  color: #909399;
+  font-size: 12px;
+  margin-left: 4px;
+}
+
+.original-price {
+  text-decoration: line-through;
+  color: #c0c4cc;
+}
+
+.discount-price {
+  color: #67c23a;
+}
+
+.points-price {
+  color: #e6a23c;
+}
+
+.final-price {
+  color: #f56c6c;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.discount-tag {
+  color: #e6a23c;
+  font-weight: 500;
 }
 </style>

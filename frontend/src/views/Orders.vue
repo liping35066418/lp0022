@@ -105,8 +105,23 @@
         <el-table-column label="退房日期" width="120">
           <template #default="{ row }">{{ row.checkout_date }}</template>
         </el-table-column>
-        <el-table-column prop="room_fee" label="房费(元)" width="110" align="right">
-          <template #default="{ row }">¥{{ (row.total_price || 0).toFixed(2) }}</template>
+        <el-table-column label="房费明细" width="180" align="right">
+          <template #default="{ row }">
+            <div class="price-detail-cell">
+              <div v-if="row.original_total && row.original_total !== row.total_price" class="original-line">
+                <span class="original">¥{{ row.original_total?.toFixed(2) }}</span>
+              </div>
+              <div v-if="row.discount_amount > 0" class="discount-line">
+                <span class="discount">-¥{{ row.discount_amount?.toFixed(2) }}</span>
+              </div>
+              <div v-if="row.points_deduction_amount > 0" class="points-line">
+                <span class="points">-¥{{ row.points_deduction_amount?.toFixed(2) }}</span>
+              </div>
+              <div class="final-line">
+                <span class="final">¥{{ row.total_price?.toFixed(2) }}</span>
+              </div>
+            </div>
+          </template>
         </el-table-column>
         <el-table-column prop="deposit" label="押金(元)" width="100" align="right">
           <template #default="{ row }">¥{{ (row.deposit || 0).toFixed(2) }}</template>
@@ -130,7 +145,7 @@
       <el-empty v-if="!loading && filteredOrders.length === 0" description="暂无已完成订单" />
     </el-card>
 
-    <el-dialog v-model="detailVisible" title="订单账单详情" width="620px">
+    <el-dialog v-model="detailVisible" title="订单账单详情" width="680px">
       <div v-if="currentOrder" class="bill-detail">
         <el-descriptions :column="2" border size="small">
           <el-descriptions-item label="订单号">{{ currentOrder.order_no }}</el-descriptions-item>
@@ -139,11 +154,55 @@
           </el-descriptions-item>
           <el-descriptions-item label="会员">
             {{ currentOrder.member_name || '散客' }}
+            <span v-if="currentOrder.member_level" class="member-level-tag">
+              ({{ getLevelName(currentOrder.member_level) }})
+            </span>
           </el-descriptions-item>
           <el-descriptions-item label="房型">{{ currentOrder.room_type_name }}</el-descriptions-item>
           <el-descriptions-item label="入住日期">{{ currentOrder.checkin_date }}</el-descriptions-item>
           <el-descriptions-item label="退房日期">{{ currentOrder.checkout_date }}</el-descriptions-item>
         </el-descriptions>
+
+        <el-divider content-position="left">房费价格明细</el-divider>
+
+        <el-descriptions :column="2" border size="small">
+          <el-descriptions-item label="原价合计">
+            <span class="original-price">¥{{ currentOrder.original_total?.toFixed(2) }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="会员折扣" v-if="currentOrder.member_discount_percent">
+            <span class="discount-tag">{{ currentOrder.member_discount_percent }}%（{{ (currentOrder.member_discount_percent / 10).toFixed(1) }}折）</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="会员优惠" v-if="currentOrder.discount_amount > 0">
+            <span class="discount-price">-¥{{ currentOrder.discount_amount?.toFixed(2) }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="折扣后金额" v-if="currentOrder.discounted_total">
+            <span>¥{{ currentOrder.discounted_total?.toFixed(2) }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="积分抵扣" v-if="currentOrder.points_deduction_amount > 0">
+            <span class="points-price">-¥{{ currentOrder.points_deduction_amount?.toFixed(2) }}（{{ currentOrder.points_deducted }}积分）</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="房费合计">
+            <span class="final-price">¥{{ currentOrder.total_price?.toFixed(2) }}</span>
+          </el-descriptions-item>
+        </el-descriptions>
+
+        <el-divider content-position="left" v-if="currentOrder.price_breakdown?.daily_breakdown?.length">每日房价明细</el-divider>
+        <el-table :data="currentOrder.price_breakdown?.daily_breakdown || []" size="small" border v-if="currentOrder.price_breakdown?.daily_breakdown?.length">
+          <el-table-column prop="date" label="日期" width="120" />
+          <el-table-column label="类型" width="100" align="center">
+            <template #default="{ row }">
+              <el-tag v-if="row.is_holiday" type="danger" size="small">{{ row.holiday_name || '节假日' }}</el-tag>
+              <el-tag v-else-if="row.is_weekend" type="warning" size="small">周末</el-tag>
+              <el-tag v-else type="info" size="small">平日</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="original_price" label="单价(元)" width="100" align="right" />
+          <el-table-column label="会员价(元)" width="100" align="right" v-if="currentOrder.member_level">
+            <template #default="{ row }">
+              <span class="discount-price">¥{{ row.discounted_price?.toFixed(2) }}</span>
+            </template>
+          </el-table-column>
+        </el-table>
 
         <el-divider content-position="left">消费明细</el-divider>
 
@@ -185,6 +244,14 @@
         <el-divider />
 
         <div class="bill-total-section">
+          <div class="total-row">
+            <span>房费合计</span>
+            <span>¥{{ billDetail.roomTotal.toFixed(2) }}</span>
+          </div>
+          <div class="total-row">
+            <span>杂费合计</span>
+            <span>¥{{ billDetail.extraTotal.toFixed(2) }}</span>
+          </div>
           <div class="total-row">
             <span>消费合计</span>
             <span>¥{{ billDetail.grandTotal.toFixed(2) }}</span>
@@ -260,11 +327,35 @@ const filteredOrders = computed(() => {
   return list
 })
 
+function getLevelName(level) {
+  const map = {
+    bronze: '普通会员',
+    silver: '银卡会员',
+    gold: '金卡会员',
+    platinum: '铂金会员'
+  }
+  return map[level] || level
+}
+
+function parsePriceBreakdown(order) {
+  if (!order) return order
+  try {
+    if (typeof order.price_breakdown === 'string') {
+      order.price_breakdown = JSON.parse(order.price_breakdown)
+    }
+  } catch (e) {
+    order.price_breakdown = null
+  }
+  return order
+}
+
 async function loadOrders() {
   loading.value = true
   try {
     const res = await request.get('/bookings', { params: { status: 'checked_out' } })
-    orders.value = res.data?.list || []
+    let list = res.data?.list || []
+    list = list.map(o => parsePriceBreakdown(o))
+    orders.value = list
     updateStats()
   } catch (e) {
     orders.value = generateMockOrders()
@@ -354,17 +445,29 @@ function resetFilters() {
 }
 
 function viewDetail(row) {
-  currentOrder.value = row
+  currentOrder.value = parsePriceBreakdown({ ...row })
   const nights = dayjs(row.checkout_date).diff(dayjs(row.checkin_date), 'day')
-  const basePrice = (row.total_price || 0) / (nights || 1)
   const roomFees = []
-  for (let i = 0; i < nights; i++) {
-    roomFees.push({
-      date: dayjs(row.checkin_date).add(i, 'day').format('YYYY-MM-DD'),
-      desc: `${row.room_type_name}房费`,
-      amount: basePrice
+  
+  if (currentOrder.value.price_breakdown?.daily_breakdown?.length) {
+    currentOrder.value.price_breakdown.daily_breakdown.forEach(day => {
+      roomFees.push({
+        date: day.date,
+        desc: `${row.room_type_name}房费${day.is_holiday ? '（节假日）' : day.is_weekend ? '（周末）' : ''}`,
+        amount: currentOrder.value.member_level ? day.discounted_price : day.original_price
+      })
     })
+  } else {
+    const basePrice = (row.total_price || 0) / (nights || 1)
+    for (let i = 0; i < nights; i++) {
+      roomFees.push({
+        date: dayjs(row.checkin_date).add(i, 'day').format('YYYY-MM-DD'),
+        desc: `${row.room_type_name}房费`,
+        amount: basePrice
+      })
+    }
   }
+  
   const extraFees = [
     { type: '餐饮', desc: '餐厅消费', amount: 88 },
     { type: '迷你吧', desc: '酒水饮料', amount: 40 }
@@ -561,5 +664,60 @@ onMounted(() => {
 .total-row .final-amount {
   color: #f56c6c;
   font-size: 22px;
+}
+
+.price-detail-cell {
+  text-align: right;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.price-detail-cell .original-line .original {
+  text-decoration: line-through;
+  color: #c0c4cc;
+}
+
+.price-detail-cell .discount-line .discount {
+  color: #67c23a;
+}
+
+.price-detail-cell .points-line .points {
+  color: #e6a23c;
+}
+
+.price-detail-cell .final-line .final {
+  color: #f56c6c;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.member-level-tag {
+  color: #909399;
+  font-size: 12px;
+  margin-left: 4px;
+}
+
+.original-price {
+  text-decoration: line-through;
+  color: #c0c4cc;
+}
+
+.discount-price {
+  color: #67c23a;
+}
+
+.points-price {
+  color: #e6a23c;
+}
+
+.final-price {
+  color: #f56c6c;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.discount-tag {
+  color: #e6a23c;
+  font-weight: 500;
 }
 </style>
